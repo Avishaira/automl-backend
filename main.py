@@ -3,10 +3,22 @@ import shutil
 import pandas as pd
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware  # <--- 1. MUST IMPORT THIS
 from pydantic import BaseModel
 import uuid
 import logging
-import ai_engine  # This imports the second file we will create
+import datetime
+# import ai_engine  # We assume this file exists next to main.py
+
+# If you don't have ai_engine.py yet, use this mock class so the code doesn't crash
+class MockAIEngine:
+    def get_best_model_code(self, df_head, target, domain):
+        return "# Mock generated code\nprint('Model Trained')"
+try:
+    import ai_engine
+except ImportError:
+    ai_engine = MockAIEngine()
+
 
 # --- CONFIGURATION ---
 UPLOAD_DIR = "uploads"
@@ -20,49 +32,62 @@ logger = logging.getLogger("AutoML_Backend")
 
 app = FastAPI(title="AutoML Pocket Backend")
 
-# --- DATA MODELS ---
+# --- 2. CORS CONFIGURATION (CRITICAL FIX) ---
+# Without this, your React app CANNOT talk to this server
+origins = ["*"]  # Allow all domains
 
-class ModelRequest(BaseModel):
-    target_column: str
-    domain: str  # 'tabular', 'image', 'audio', 'timeseries'
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class ModelResponse(BaseModel):
-    model_id: str
-    status: str
-    message: str
-    suggested_model_type: str
+# --- IN-MEMORY DATABASE (For Prototype) ---
+# Stores the list of models so the Frontend can fetch them
+projects_db = []
 
 # --- CORE LOGIC ---
 
-def train_worker(model_id: str, file_path: str, target: str, domain: str):
+def train_worker(model_id: str, file_path: str, target: str = "auto", domain: str = "tabular"):
     """
-    THE WORKER LAYER
-    Executes the training in the background.
+    Executes training in background and updates the in-memory DB.
     """
     logger.info(f"Starting training for Model {model_id}...")
     
+    # Find the model in DB to update status
+    model_entry = next((item for item in projects_db if item["id"] == model_id), None)
+    
     try:
-        # 1. Load the first few rows to show the 'AI'
+        # 1. Load data
         df = pd.read_csv(file_path)
         
-        # 2. Ask 'AI' to write code (Using the ai_engine module)
+        # 2. Simulate AI work
+        # In a real app, 'target' would be selected by user. Here we default/guess.
+        if target == "auto":
+            target = df.columns[-1] # Simple guess: last column is target
+            
         code = ai_engine.get_best_model_code(df.head(), target, domain)
         
-        # 3. Save the generated code for the user to see later
+        # 3. Save code
         code_path = os.path.join(MODELS_DIR, f"{model_id}.py")
         with open(code_path, "w") as f:
             f.write(code)
             
-        # 4. EXECUTE (In production, this happens in a Docker container)
-        # For prototype, we simulate success
-        logger.info(f"Generated Code saved to {code_path}")
-        logger.info(f"Simulating training execution...")
-        
-        # Simulate artifacts
-        logger.info(f"Model {model_id} training complete. Accuracy: 0.89")
+        # 4. Update DB on success
+        if model_entry:
+            model_entry["status"] = "completed"
+            model_entry["accuracy"] = "92.4%" # Mock accuracy
+            model_entry["progress"] = 100
+            
+        logger.info(f"Model {model_id} training complete.")
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        if model_entry:
+            model_entry["status"] = "failed"
+            model_entry["error"] = str(e)
 
 # --- API ENDPOINTS ---
 
@@ -70,75 +95,52 @@ def train_worker(model_id: str, file_path: str, target: str, domain: str):
 def health_check():
     return {"status": "running", "service": "AutoML Backend"}
 
+# 3. ADDED: GET /models endpoint
+# This is what the React app polls to check connection and get list
+@app.get("/models")
+def get_models():
+    return {"models": projects_db}
+
 @app.post("/upload")
-async def upload_dataset(file: UploadFile = File(...)):
+async def upload_dataset(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
-    Step 1: User uploads a CSV. We save it and return the columns
-    so the user can choose the 'Target'.
+    Modified to match React App: Uploads AND starts 'auto' training immediately.
     """
-    file_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}.csv")
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    # Analyze columns to send back to frontend
     try:
-        df = pd.read_csv(file_path)
-        columns = list(df.columns)
-        return {
-            "file_id": file_id,
-            "filename": file.filename,
-            "columns": columns,
-            "preview": df.head(5).to_dict()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid CSV file")
-
-@app.post("/train/{file_id}")
-async def start_training(
-    file_id: str, 
-    request: ModelRequest, 
-    background_tasks: BackgroundTasks
-):
-    """
-    Step 2: User selects target and domain. We start the background worker.
-    """
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}.csv")
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        # 1. Save File
+        file_id = str(uuid.uuid4())
+        filename = file.filename
+        file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{filename}")
         
-    model_id = str(uuid.uuid4())
-    
-    # Start the heavy lifting in the background so the UI doesn't freeze
-    background_tasks.add_task(train_worker, model_id, file_path, request.target_column, request.domain)
-    
-    return {
-        "model_id": model_id,
-        "status": "processing",
-        "message": "The AI Architect is analyzing your data and writing code..."
-    }
-
-@app.get("/model/{model_id}")
-async def get_model_status(model_id: str):
-    """
-    Step 3: Frontend polls this to check if training is done.
-    """
-    code_path = os.path.join(MODELS_DIR, f"{model_id}.py")
-    
-    if os.path.exists(code_path):
-        # Read the generated code to show the user
-        with open(code_path, "r") as f:
-            generated_code = f.read()
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
             
-        return {
-            "status": "ready",
-            "accuracy": "89.5%", # Mocked for prototype
-            "code": generated_code
+        # 2. Create Model Entry (so UI shows it immediately)
+        model_id = str(uuid.uuid4())
+        new_model = {
+            "id": model_id,
+            "name": filename.split('.')[0],
+            "type": "Auto-Detected",
+            "status": "training",
+            "accuracy": None,
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "file_id": file_id
         }
-    else:
-        return {"status": "processing"}
+        projects_db.insert(0, new_model) # Add to start of list
+        
+        # 3. Start Background Training Immediately
+        # We assume 'tabular' and auto-target for this "One-Click" flow
+        background_tasks.add_task(train_worker, model_id, file_path, "auto", "tabular")
+        
+        # 4. Return the model object (React app expects this)
+        return new_model
+
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Upload failed")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use the PORT environment variable provided by Render, default to 8000
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
