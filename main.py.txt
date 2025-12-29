@@ -1,0 +1,144 @@
+import os
+import shutil
+import pandas as pd
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import uuid
+import logging
+import ai_engine  # This imports the second file we will create
+
+# --- CONFIGURATION ---
+UPLOAD_DIR = "uploads"
+MODELS_DIR = "models"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("AutoML_Backend")
+
+app = FastAPI(title="AutoML Pocket Backend")
+
+# --- DATA MODELS ---
+
+class ModelRequest(BaseModel):
+    target_column: str
+    domain: str  # 'tabular', 'image', 'audio', 'timeseries'
+
+class ModelResponse(BaseModel):
+    model_id: str
+    status: str
+    message: str
+    suggested_model_type: str
+
+# --- CORE LOGIC ---
+
+def train_worker(model_id: str, file_path: str, target: str, domain: str):
+    """
+    THE WORKER LAYER
+    Executes the training in the background.
+    """
+    logger.info(f"Starting training for Model {model_id}...")
+    
+    try:
+        # 1. Load the first few rows to show the 'AI'
+        df = pd.read_csv(file_path)
+        
+        # 2. Ask 'AI' to write code (Using the ai_engine module)
+        code = ai_engine.get_best_model_code(df.head(), target, domain)
+        
+        # 3. Save the generated code for the user to see later
+        code_path = os.path.join(MODELS_DIR, f"{model_id}.py")
+        with open(code_path, "w") as f:
+            f.write(code)
+            
+        # 4. EXECUTE (In production, this happens in a Docker container)
+        # For prototype, we simulate success
+        logger.info(f"Generated Code saved to {code_path}")
+        logger.info(f"Simulating training execution...")
+        
+        # Simulate artifacts
+        logger.info(f"Model {model_id} training complete. Accuracy: 0.89")
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+
+# --- API ENDPOINTS ---
+
+@app.get("/")
+def health_check():
+    return {"status": "running", "service": "AutoML Backend"}
+
+@app.post("/upload")
+async def upload_dataset(file: UploadFile = File(...)):
+    """
+    Step 1: User uploads a CSV. We save it and return the columns
+    so the user can choose the 'Target'.
+    """
+    file_id = str(uuid.uuid4())
+    file_path = os.path.join(UPLOAD_DIR, f"{file_id}.csv")
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Analyze columns to send back to frontend
+    try:
+        df = pd.read_csv(file_path)
+        columns = list(df.columns)
+        return {
+            "file_id": file_id,
+            "filename": file.filename,
+            "columns": columns,
+            "preview": df.head(5).to_dict()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid CSV file")
+
+@app.post("/train/{file_id}")
+async def start_training(
+    file_id: str, 
+    request: ModelRequest, 
+    background_tasks: BackgroundTasks
+):
+    """
+    Step 2: User selects target and domain. We start the background worker.
+    """
+    file_path = os.path.join(UPLOAD_DIR, f"{file_id}.csv")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    model_id = str(uuid.uuid4())
+    
+    # Start the heavy lifting in the background so the UI doesn't freeze
+    background_tasks.add_task(train_worker, model_id, file_path, request.target_column, request.domain)
+    
+    return {
+        "model_id": model_id,
+        "status": "processing",
+        "message": "The AI Architect is analyzing your data and writing code..."
+    }
+
+@app.get("/model/{model_id}")
+async def get_model_status(model_id: str):
+    """
+    Step 3: Frontend polls this to check if training is done.
+    """
+    code_path = os.path.join(MODELS_DIR, f"{model_id}.py")
+    
+    if os.path.exists(code_path):
+        # Read the generated code to show the user
+        with open(code_path, "r") as f:
+            generated_code = f.read()
+            
+        return {
+            "status": "ready",
+            "accuracy": "89.5%", # Mocked for prototype
+            "code": generated_code
+        }
+    else:
+        return {"status": "processing"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

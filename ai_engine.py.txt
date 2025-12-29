@@ -1,0 +1,96 @@
+import openai
+import pandas as pd
+import os
+
+# You would set your API key in your environment variables
+# api_key = os.getenv("OPENAI_API_KEY") 
+
+def get_best_model_code(df_head: pd.DataFrame, target: str, domain: str) -> str:
+    """
+    This function sends the data structure to the smartest AI available (e.g., GPT-4o)
+    and demands a world-class solution.
+    """
+    
+    # --- MOCK RESPONSE FOR DEMO ---
+    # In a real app, this calls openai.ChatCompletion.create()
+    return mock_gpt_4_response(domain, target)
+
+def mock_gpt_4_response(domain, target):
+    if domain == 'tabular':
+        return f"""
+import pandas as pd
+import xgboost as xgb
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+import joblib
+
+# 1. Load Data
+df = pd.read_csv('dataset.csv')
+
+# 2. Advanced Preprocessing
+# Auto-detect categorical columns
+for col in df.select_dtypes(include=['object']).columns:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col].astype(str))
+
+X = df.drop('{target}', axis=1)
+y = df['{target}']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 3. Model Selection & Hyperparameter Optimization
+# We use XGBoost, the current gold standard for tabular data
+clf = xgb.XGBClassifier(eval_metric='logloss')
+
+param_dist = {{
+    'n_estimators': [100, 300, 500],
+    'learning_rate': [0.01, 0.1, 0.3],
+    'max_depth': [3, 5, 7, 9],
+    'colsample_bytree': [0.5, 0.7, 1.0],
+    'subsample': [0.5, 0.7, 1.0]
+}}
+
+# Random search to find best parameters
+search = RandomizedSearchCV(clf, param_distributions=param_dist, n_iter=10, cv=3, verbose=1)
+search.fit(X_train, y_train)
+
+best_model = search.best_estimator_
+
+# 4. Evaluation
+preds = best_model.predict(X_test)
+acc = accuracy_score(y_test, preds)
+print(f"Best Model Accuracy: {{acc:.4f}}")
+print(f"Best Params: {{search.best_params_}}")
+
+# 5. Save Artifacts
+joblib.dump(best_model, 'model.pkl')
+"""
+    elif domain == 'timeseries':
+        return f"""
+import pandas as pd
+from prophet import Prophet
+import joblib
+
+# 1. Load Data
+df = pd.read_csv('dataset.csv')
+
+# 2. Time Series Prep (Prophet requires 'ds' and 'y' columns)
+# AI assumes the first column is date and target is y
+df.columns = ['ds', 'y'] + list(df.columns[2:])
+df['ds'] = pd.to_datetime(df['ds'])
+
+# 3. Training with Seasonality
+m = Prophet(daily_seasonality=True, yearly_seasonality=True)
+m.fit(df)
+
+# 4. Future Prediction (Self-Test)
+future = m.make_future_dataframe(periods=30)
+forecast = m.predict(future)
+
+# 5. Save
+joblib.dump(m, 'model.pkl')
+print("Time Series Model Trained with Prophet")
+"""
+    else:
+        return "# AI: Logic for Audio/Image not mocked in this preview, but GPT-4 would generate CNN code here."
