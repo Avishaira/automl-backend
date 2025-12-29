@@ -8,6 +8,7 @@ import logging
 import datetime
 import uuid
 import traceback
+import time
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -15,7 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# --- GENAI & ML IMPORTS ---
 import google.generativeai as genai
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -24,23 +24,21 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.metrics import accuracy_score, r2_score
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.metrics import accuracy_score, r2_score, mean_absolute_error
 
 # --- CONFIGURATION ---
 UPLOAD_DIR = "uploads"
-MODELS_DIR = "models"
 ARTIFACTS_DIR = "artifacts"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoML_Brain")
 
-app = FastAPI(title="Gemini-Powered AutoML")
+app = FastAPI(title="Gemini Expert AutoML")
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,112 +47,131 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DB ---
+# --- IN-MEMORY DATABASE ---
+# Format: { id: str, status: str, logs: list[str], artifacts: dict, ... }
 projects_db = []
 
-# --- GEMINI INTEGRATION ---
+def add_log(model_id: str, message: str):
+    """Helper to push logs to the specific project"""
+    entry = next((item for item in projects_db if item["id"] == model_id), None)
+    if entry:
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        entry["logs"].append(log_entry)
+        logger.info(f"Project {model_id}: {message}")
+
+# --- GEMINI BRAIN ---
 class GeminiBrain:
     def __init__(self):
-        # Tries to get key from environment variable
         self.api_key = os.environ.get("GOOGLE_API_KEY")
         if self.api_key:
             genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-pro')
+            self.model = genai.GenerativeModel('gemini-2.0-flash') # or gemini-pro
             self.active = True
         else:
-            logger.warning("GOOGLE_API_KEY not found. Falling back to heuristic mode.")
             self.active = False
 
-    def analyze_dataset(self, df_head_csv: str):
-        """
-        Sends the data preview to Gemini to decide strategy.
-        """
-        if not self.active:
-            return None
-
+    def analyze(self, df_head_csv):
+        if not self.active: return None
         prompt = f"""
-        You are a World-Class Machine Learning Engineer.
-        Analyze this dataset sample (CSV format):
-        
+        Act as a Senior Data Scientist. Analyze this dataset sample (CSV):
         {df_head_csv}
         
-        Task:
-        1. Identify the most likely Target Column (label) for prediction.
-        2. Determine if this is a "Classification" or "Regression" problem.
-        3. Suggest the best model architecture (e.g. Random Forest, Gradient Boosting).
-        4. List key feature engineering steps needed.
-
-        Return ONLY a raw JSON object (no markdown, no quotes around keys) with this structure:
+        Decide:
+        1. Target Column (prediction label).
+        2. Problem Type (Classification/Regression).
+        3. Split Strategy (e.g., 80/20, 70/30).
+        4. Cleaning Strategy (Imputation methods).
+        
+        Return JSON ONLY:
         {{
-            "target_column": "string",
-            "problem_type": "classification" or "regression",
-            "suggested_model": "string",
-            "reasoning": "string"
+            "target": "col_name",
+            "type": "classification" or "regression",
+            "split_ratio": 0.2,
+            "cleaning_notes": "string explanation",
+            "recommended_models": ["RandomForest", "GradientBoosting"]
         }}
         """
         try:
-            response = self.model.generate_content(prompt)
-            # Cleanup json format if Gemini adds markdown blocks
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
-        except Exception as e:
-            logger.error(f"Gemini analysis failed: {e}")
+            res = self.model.generate_content(prompt)
+            clean_text = res.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_text)
+        except:
             return None
 
-# --- AUTOML SYSTEM ---
-class AutoMLSystem:
-    def __init__(self, filepath):
+# --- THE ML ENGINEER ENGINE ---
+class MLEngineer:
+    def __init__(self, model_id, filepath):
+        self.model_id = model_id
         self.filepath = filepath
-        self.df = pd.read_csv(filepath)
-        self.target_col = None
-        self.model_type = None
         self.brain = GeminiBrain()
+        self.df = pd.read_csv(filepath)
+        self.artifacts = {} # Stores paths to saved files
+        self.strategy = {}
+        self.best_model = None
+        self.best_score = -np.inf
+        self.best_algo_name = ""
+        self.target = None
+        self.model_type = None
         
-        self.pipeline = None
-        self.label_encoder = None
-        self.best_score = 0
-        self.insights = {}
+    def log(self, msg):
+        add_log(self.model_id, msg)
 
-    def plan_and_execute(self):
-        # 1. Ask Gemini for the Strategy
-        analysis = self.brain.analyze_dataset(self.df.head(10).to_csv(index=False))
+    def step_1_analysis(self):
+        self.log("Step 1: Reading dataset and scanning variables...")
+        self.log(f"Dataset shape: {self.df.shape[0]} rows, {self.df.shape[1]} columns.")
         
-        if analysis:
-            logger.info(f"Gemini Insights: {analysis}")
-            self.target_col = analysis.get("target_column")
-            self.model_type = analysis.get("problem_type").lower()
-            self.insights = analysis
+        head_csv = self.df.head(5).to_csv(index=False)
+        self.log("Sending data sample to Gemini AI for strategic analysis...")
+        
+        ai_advice = self.brain.analyze(head_csv)
+        
+        if ai_advice:
+            self.log("AI Analysis Complete.")
+            self.log(f"Decided Target Variable: '{ai_advice.get('target')}'")
+            self.log(f"Problem Type Identified: {ai_advice.get('type').upper()}")
+            self.strategy = ai_advice
+            self.target = ai_advice.get('target')
+            self.model_type = ai_advice.get('type').lower()
         else:
-            # Fallback Heuristics (if Gemini fails or no key)
-            logger.info("Using Heuristics fallback")
-            potential = [c for c in self.df.columns if c.lower() in ['target', 'class', 'label', 'y', 'price', 'churn', 'survived']]
-            self.target_col = potential[0] if potential else self.df.columns[-1]
+            self.log("AI unavailable, using heuristic backup.")
+            self.target = self.df.columns[-1]
+            self.model_type = "classification" if self.df[self.target].nunique() < 20 else "regression"
+            self.strategy = {"split_ratio": 0.2, "cleaning_notes": "Standard Auto-Imputation"}
             
-            y = self.df[self.target_col]
-            if y.dtype == 'object' or y.nunique() < 20:
-                self.model_type = "classification"
-            else:
-                self.model_type = "regression"
+        # Validation
+        if self.target not in self.df.columns:
+            self.target = self.df.columns[-1]
+            self.log(f"Correction: Target set to '{self.target}'")
 
-        # Validate columns exist
-        if self.target_col not in self.df.columns:
-            # Fallback if Gemini hallucinated a column name
-            self.target_col = self.df.columns[-1]
-
-        # 2. Prepare Data
-        X = self.df.drop(columns=[self.target_col])
-        y = self.df[self.target_col]
-
-        # Handle Categorical Target
+    def step_2_cleaning(self):
+        self.log("Step 2: Performing Data Cleaning & Engineering...")
+        self.log(f"AI Cleaning Strategy: {self.strategy.get('cleaning_notes', 'Auto')}")
+        
+        # Save Original
+        orig_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_original.csv")
+        self.df.to_csv(orig_path, index=False)
+        self.artifacts["original_data"] = orig_path
+        
+        # Logic
+        X = self.df.drop(columns=[self.target])
+        y = self.df[self.target]
+        
+        # Label Encode Target if Classification
+        self.le = None
         if self.model_type == "classification" and y.dtype == 'object':
-            self.label_encoder = LabelEncoder()
-            y = self.label_encoder.fit_transform(y)
-
-        # 3. Build Pipeline (Smart Preprocessing)
+            self.log("Encoding target variable labels to numbers...")
+            self.le = LabelEncoder()
+            y = self.le.fit_transform(y)
+            
+        # Define Preprocessing Pipeline
         numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
         categorical_features = X.select_dtypes(include=['object', 'bool']).columns
-
-        preprocessor = ColumnTransformer(
+        
+        self.log(f"Detected {len(numeric_features)} numeric and {len(categorical_features)} categorical features.")
+        
+        # Create Transformers
+        self.preprocessor = ColumnTransformer(
             transformers=[
                 ('num', Pipeline([
                     ('imputer', SimpleImputer(strategy='median')),
@@ -162,162 +179,232 @@ class AutoMLSystem:
                 ]), numeric_features),
                 ('cat', Pipeline([
                     ('imputer', SimpleImputer(strategy='most_frequent')),
-                    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+                    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
                 ]), categorical_features)
-            ])
-
-        # 4. Train Models (The "Competition")
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            ], verbose_feature_names_out=False)
+            
+        # Fit and Transform to get Cleaned Data
+        self.log("Applying transformations...")
+        X_processed = self.preprocessor.fit_transform(X)
         
-        models_to_try = []
+        # Save Cleaned Dataset (Reconstruct DataFrame)
+        # Get feature names
+        try:
+            feat_names = list(numeric_features)
+            # This is complex for OneHot, simplified here for robustness
+            if hasattr(self.preprocessor.named_transformers_['cat'], 'get_feature_names_out'):
+                 cat_names = self.preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features)
+                 feat_names.extend(cat_names)
+        except:
+            feat_names = [f"col_{i}" for i in range(X_processed.shape[1])]
+
+        clean_df = pd.DataFrame(X_processed)
+        clean_df['TARGET'] = y
+        clean_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_cleaned.csv")
+        clean_df.to_csv(clean_path, index=False)
+        self.artifacts["cleaned_data"] = clean_path
+        self.log("Saved 'cleaned_dataset.csv'.")
+        
+        return X, y
+
+    def step_3_splitting(self, X, y):
+        ratio = self.strategy.get("split_ratio", 0.2)
+        self.log(f"Step 3: Splitting Dataset. Train: {int((1-ratio)*100)}% | Test: {int(ratio*100)}%")
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=ratio, random_state=42)
+        
+        # Save Split Files
+        train_df = pd.concat([X_train, pd.Series(y_train, name=self.target, index=X_train.index)], axis=1)
+        test_df = pd.concat([X_test, pd.Series(y_test, name=self.target, index=X_test.index)], axis=1)
+        
+        train_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_train.csv")
+        test_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_test.csv")
+        
+        train_df.to_csv(train_path, index=False)
+        test_df.to_csv(test_path, index=False)
+        
+        self.artifacts["train_data"] = train_path
+        self.artifacts["test_data"] = test_path
+        self.log("Saved 'train.csv' and 'test.csv'.")
+        
+        return X_train, X_test, y_train, y_test
+
+    def step_4_training(self, X_train, X_test, y_train, y_test):
+        self.log("Step 4: Starting Model Tournament...")
+        
+        models = []
         if self.model_type == "classification":
-            models_to_try = [
-                ("RandomForest", RandomForestClassifier(n_estimators=100)),
-                ("GradientBoosting", GradientBoostingClassifier()),
-                ("LogisticRegression", LogisticRegression(max_iter=1000))
+            models = [
+                ("Random Forest", RandomForestClassifier(n_estimators=100)),
+                ("Gradient Boosting", GradientBoostingClassifier()),
+                ("Logistic Regression", LogisticRegression(max_iter=1000)),
+                ("K-Nearest Neighbors", KNeighborsClassifier())
             ]
         else:
-            models_to_try = [
-                ("RandomForest", RandomForestRegressor(n_estimators=100)),
-                ("GradientBoosting", GradientBoostingRegressor()),
-                ("LinearRegression", LinearRegression())
+            models = [
+                ("Random Forest Regressor", RandomForestRegressor(n_estimators=100)),
+                ("Gradient Boosting Regressor", GradientBoostingRegressor()),
+                ("Linear Regression", LinearRegression()),
+                ("KNN Regressor", KNeighborsRegressor())
             ]
-
-        best_model = None
-        best_name = ""
-        best_score = -np.inf
-
-        for name, model_inst in models_to_try:
-            pipe = Pipeline(steps=[('preprocessor', preprocessor), ('model', model_inst)])
-            pipe.fit(X_train, y_train)
             
-            score = 0
+        for name, model in models:
+            self.log(f"Training {name} with default hyperparameters...")
+            pipeline = Pipeline(steps=[('preprocessor', self.preprocessor), ('model', model)])
+            
+            pipeline.fit(X_train, y_train)
+            
             if self.model_type == "classification":
-                score = accuracy_score(y_test, pipe.predict(X_test))
+                score = accuracy_score(y_test, pipeline.predict(X_test))
+                metric_name = "Accuracy"
             else:
-                score = r2_score(y_test, pipe.predict(X_test))
+                score = r2_score(y_test, pipeline.predict(X_test))
+                metric_name = "R2 Score"
+                
+            self.log(f"--> {name} Result: {metric_name} = {round(score, 4)}")
             
-            if score > best_score:
-                best_score = score
-                best_model = pipe
-                best_name = name
+            if score > self.best_score:
+                self.best_score = score
+                self.best_model = pipeline
+                self.best_algo_name = name
+                
+        self.log(f"Step 5: Tournament Winner Identified: {self.best_algo_name}")
+        self.log(f"Final Accuracy/Score: {round(self.best_score * 100, 2)}%")
 
-        self.pipeline = best_model
-        self.best_score = best_score
+    def step_5_artifacts(self):
+        self.log("Step 6: Generating deployment artifacts...")
         
-        return {
-            "target": self.target_col,
-            "type": self.model_type,
-            "score": round(best_score * 100, 2),
-            "algorithm": best_name,
-            "reasoning": self.insights.get("reasoning", "Best statistical fit selected.")
-        }
-
-    def save_artifacts(self, model_id):
-        # Save Pickle
-        joblib.dump({
-            "pipeline": self.pipeline,
-            "label_encoder": self.label_encoder
-        }, os.path.join(ARTIFACTS_DIR, f"{model_id}.pkl"))
-
-        # Save Python Code (Generated dynamically)
+        # Save Model
+        model_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_model.pkl")
+        joblib.dump({"pipeline": self.best_model, "le": self.le}, model_path)
+        self.artifacts["model_file"] = model_path
+        
+        # Generate Reproducible Code
         code = f"""
-# Machine Learning Pipeline generated by AutoML
-# Target Column: {self.target_col}
+# Reproducible Machine Learning Script
+# Generated by AI Master Engineer
+# ----------------------------------
 # Problem Type: {self.model_type}
-# Insights: {self.insights.get('reasoning', 'N/A')}
+# Target Variable: {self.target}
+# Best Model: {self.best_algo_name}
+# Score: {round(self.best_score, 4)}
 
 import pandas as pd
-import joblib
+import numpy as np
 from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.metrics import accuracy_score, r2_score
 
 # 1. Load Data
+# Ensure you have 'dataset.csv' in the same folder
+print("Loading dataset...")
 df = pd.read_csv('dataset.csv')
-target = '{self.target_col}'
 
-X = df.drop(columns=[target])
-y = df[target]
+X = df.drop(columns=['{self.target}'])
+y = df['{self.target}']
 
-# 2. Load Trained Pipeline
-# The pipeline handles scaling, encoding and imputation automatically
-model = joblib.load('{model_id}.pkl')
+# 2. Preprocessing
+print("Preprocessing data...")
+numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
+categorical_features = X.select_dtypes(include=['object', 'bool']).columns
 
-# 3. Predict
-print("Running predictions...")
-# predictions = model.predict(X)
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
+        ]), numeric_features),
+        ('cat', Pipeline([
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore'))
+        ]), categorical_features)
+    ])
+
+# 3. Model Definition ({self.best_algo_name})
+model = {self.best_model.named_steps['model']}
+
+pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('model', model)])
+
+# 4. Train
+print("Training model...")
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size={self.strategy.get('split_ratio', 0.2)}, random_state=42)
+pipeline.fit(X_train, y_train)
+
+# 5. Evaluate
+print("Evaluating...")
+score = pipeline.score(X_test, y_test)
+print(f"Final Score: {{score}}")
 """
-        with open(os.path.join(MODELS_DIR, f"{model_id}.py"), "w") as f:
+        code_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_code.py")
+        with open(code_path, "w") as f:
             f.write(code)
+        self.artifacts["code_file"] = code_path
+        self.log("Full Python code generated successfully.")
 
-# --- WORKER ---
-def train_worker_real(model_id: str, file_path: str):
-    logger.info(f"Engineer working on {model_id}")
-    model_entry = next((item for item in projects_db if item["id"] == model_id), None)
+def run_pipeline(model_id: str, file_path: str):
+    engineer = MLEngineer(model_id, file_path)
+    
+    # Locate project entry
+    entry = next((item for item in projects_db if item["id"] == model_id), None)
     
     try:
-        automl = AutoMLSystem(file_path)
-        result = automl.plan_and_execute()
-        automl.save_artifacts(model_id)
+        # EXECUTE STEPS
+        engineer.step_1_analysis()
+        X, y = engineer.step_2_cleaning()
+        X_train, X_test, y_train, y_test = engineer.step_3_splitting(X, y)
+        engineer.step_4_training(X_train, X_test, y_train, y_test)
+        engineer.step_5_artifacts()
         
-        if model_entry:
-            model_entry["status"] = "completed"
-            model_entry["accuracy"] = f"{result['score']}%"
-            model_entry["target_col"] = result['target']
-            model_entry["code_url"] = f"/models/{model_id}/code"
-            model_entry["description"] = result['reasoning']
+        # Update DB
+        if entry:
+            entry["status"] = "completed"
+            entry["accuracy"] = f"{round(engineer.best_score * 100, 2)}%"
+            entry["artifacts"] = engineer.artifacts # Store paths
             
     except Exception as e:
-        logger.error(f"Error: {traceback.format_exc()}")
-        if model_entry:
-            model_entry["status"] = "failed"
-            model_entry["error"] = str(e)
+        engineer.log(f"CRITICAL ERROR: {str(e)}")
+        logger.error(traceback.format_exc())
+        if entry:
+            entry["status"] = "failed"
+            entry["error"] = str(e)
 
-# --- API ---
+# --- API ENDPOINTS ---
+
 @app.get("/")
-def health_check():
-    return {"status": "running", "service": "Gemini AutoML"}
+def health(): return {"status": "online"}
 
 @app.get("/models")
-def get_models():
-    return {"models": projects_db}
+def get_models(): return {"models": projects_db}
 
-@app.get("/models/{model_id}/code")
-def get_code(model_id: str):
-    return FileResponse(os.path.join(MODELS_DIR, f"{model_id}.py"))
+@app.get("/models/{model_id}/logs")
+def get_logs(model_id: str):
+    entry = next((item for item in projects_db if item["id"] == model_id), None)
+    if not entry: raise HTTPException(404, "Model not found")
+    return {"logs": entry["logs"], "status": entry["status"], "artifacts": entry.get("artifacts", {})}
 
-@app.get("/files/{filename}")
-def get_file(filename: str):
-    return FileResponse(os.path.join(UPLOAD_DIR, filename))
-
-class PredictReq(BaseModel):
-    data: Dict[str, Any]
-
-@app.post("/predict/{model_id}")
-def predict(model_id: str, req: PredictReq):
-    path = os.path.join(ARTIFACTS_DIR, f"{model_id}.pkl")
-    if not os.path.exists(path):
-        raise HTTPException(404, "Model not ready")
-    
-    try:
-        artifact = joblib.load(path)
-        model = artifact["pipeline"]
-        le = artifact["label_encoder"]
+@app.get("/download/{model_id}/{file_type}")
+def download_file(model_id: str, file_type: str):
+    entry = next((item for item in projects_db if item["id"] == model_id), None)
+    if not entry or "artifacts" not in entry:
+        raise HTTPException(404, "Artifacts not ready")
         
-        df = pd.DataFrame([req.data])
-        pred = model.predict(df)[0]
+    path = entry["artifacts"].get(file_type) # original_data, cleaned_data, train_data, test_data, code_file, model_file
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "File not found")
         
-        if le:
-            pred = le.inverse_transform([int(pred)])[0]
-            
-        return {"prediction": str(pred), "model_id": model_id}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    return FileResponse(path, filename=os.path.basename(path))
 
 @app.post("/upload")
 async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fid = str(uuid.uuid4())
-    clean = file.filename.replace(" ", "_")
-    path = os.path.join(UPLOAD_DIR, clean)
+    filename = file.filename.replace(" ", "_")
+    path = os.path.join(UPLOAD_DIR, f"{fid}_{filename}")
     
     with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -325,15 +412,16 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     mid = str(uuid.uuid4())
     entry = {
         "id": mid,
-        "name": clean,
+        "name": filename,
         "status": "training",
         "accuracy": None,
+        "logs": [],
         "created_at": datetime.datetime.now().strftime("%H:%M"),
-        "file_url": f"/files/{clean}"
+        "artifacts": {}
     }
     projects_db.insert(0, entry)
     
-    bg_tasks.add_task(train_worker_real, mid, path)
+    bg_tasks.add_task(run_pipeline, mid, path)
     return entry
 
 if __name__ == "__main__":
