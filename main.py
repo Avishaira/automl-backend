@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import google.generativeai as genai
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -116,7 +116,7 @@ class MLEngineer:
     def log(self, msg):
         add_log(self.model_id, msg)
 
-    # --- STEP 1: INITIAL ANALYSIS (PRE-APPROVAL) ---
+    # --- STEP 1: INITIAL ANALYSIS ---
     def analyze_data_structure(self):
         self.log("Step 1: Scanning dataset structure...")
         
@@ -128,7 +128,7 @@ class MLEngineer:
         
         suggestion = {
             "all_columns": columns,
-            "target": columns[-1], # Default
+            "target": columns[-1],
             "drop_columns": [],
             "type": "regression",
             "reasoning": "Automatic heuristic"
@@ -143,14 +143,13 @@ class MLEngineer:
         else:
             self.log("AI unavailable. Waiting for user input.")
             
-        # Update DB with suggestions so Frontend can show them
         entry = next((item for item in projects_db if item["id"] == self.model_id), None)
         if entry:
             entry["analysis_result"] = suggestion
             entry["status"] = "pending_approval"
             self.log("Waiting for user approval on variables...")
 
-    # --- STEP 2: EXECUTION (POST-APPROVAL) ---
+    # --- STEP 2: EXECUTION ---
     def execute_training(self, user_config):
         self.target = user_config.get("target")
         drops = user_config.get("drop_columns", [])
@@ -160,7 +159,6 @@ class MLEngineer:
             self.log(f"Dropping columns based on user selection: {len(drops)} columns")
             self.df = self.df.drop(columns=[c for c in drops if c in self.df.columns])
             
-        # Re-eval type based on final target
         y = self.df[self.target]
         if y.dtype == 'object' or y.nunique() < 20:
             self.model_type = "classification"
@@ -169,7 +167,6 @@ class MLEngineer:
             
         self.log(f"Task Type: {self.model_type.upper()}")
         
-        # Chain remaining steps
         X, y = self.step_2_cleaning()
         X_train, X_test, y_train, y_test = self.step_3_splitting(X, y)
         self.step_4_training(X_train, X_test, y_train, y_test)
@@ -178,7 +175,6 @@ class MLEngineer:
     def step_2_cleaning(self):
         self.log("Step 2: Data Cleaning & Feature Engineering...")
         
-        # Save Original (Cleaned of drops)
         orig_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_original.csv")
         self.df.to_csv(orig_path, index=False)
         self.artifacts["original_data"] = orig_path
@@ -186,18 +182,15 @@ class MLEngineer:
         X = self.df.drop(columns=[self.target])
         y = self.df[self.target]
 
-        # Extract Metadata for UI Form
+        # Extract Metadata
         self.feature_metadata = []
         for col in X.columns:
             col_data = X[col]
             meta = {"name": col}
             
-            # --- INTELLIGENT TYPE DETECTION FOR UI ---
             unique_count = col_data.nunique()
             is_numeric = pd.api.types.is_numeric_dtype(col_data)
             
-            # If numeric but has very few unique values (e.g. 1, 2, 3), treat as categorical dropdown
-            # This prevents entering "1.34" for discrete variables
             if is_numeric and unique_count > 15:
                 meta["type"] = "number"
                 meta["min"] = float(col_data.min()) if not pd.isna(col_data.min()) else 0
@@ -205,14 +198,13 @@ class MLEngineer:
                 meta["default"] = float(round(col_data.mean(), 2)) if not pd.isna(col_data.mean()) else 0
             else:
                 meta["type"] = "categorical"
-                # Convert to string to ensure dropdown consistency
-                unique_vals = sorted(col_data.unique().tolist())
-                meta["options"] = [str(v) for v in unique_vals][:50] # Limit size
-                meta["default"] = str(unique_vals[0]) if unique_vals else ""
+                unique_vals = sorted(col_data.astype(str).unique().tolist())
+                meta["options"] = unique_vals[:50]
+                meta["default"] = unique_vals[0] if unique_vals else ""
             
             self.feature_metadata.append(meta)
         
-        # Cleaning Logic
+        # Encoding Target
         if self.model_type == "classification" and y.dtype == 'object':
             self.le = LabelEncoder()
             y = self.le.fit_transform(y)
@@ -250,7 +242,6 @@ class MLEngineer:
         train_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_train.csv")
         test_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_test.csv")
         
-        # Save artifacts
         try:
             pd.concat([X_train, pd.Series(y_train, name='target', index=X_train.index)], axis=1).to_csv(train_path, index=False)
             pd.concat([X_test, pd.Series(y_test, name='target', index=X_test.index)], axis=1).to_csv(test_path, index=False)
@@ -261,7 +252,7 @@ class MLEngineer:
         return X_train, X_test, y_train, y_test
 
     def step_4_training(self, X_train, X_test, y_train, y_test):
-        self.log("Step 4: Running Model Tournament...")
+        self.log("Step 4: Running Professional Model Tournament (Cross-Validation)...")
         
         models = []
         if self.model_type == "classification":
@@ -271,34 +262,57 @@ class MLEngineer:
                 ("Logistic Regression", LogisticRegression(max_iter=1000)),
                 ("KNN", KNeighborsClassifier())
             ]
+            scoring = 'accuracy'
         else:
             models = [
-                ("Random Forest", RandomForestRegressor(n_estimators=100)),
-                ("Gradient Boosting", GradientBoostingRegressor()),
+                ("Random Forest Regressor", RandomForestRegressor(n_estimators=100)),
+                ("Gradient Boosting Regressor", GradientBoostingRegressor()),
                 ("Linear Regression", LinearRegression()),
-                ("KNN", KNeighborsRegressor())
+                ("KNN Regressor", KNeighborsRegressor())
             ]
+            scoring = 'r2'
             
         for name, model in models:
-            self.log(f"Training {name}...")
             pipeline = Pipeline(steps=[('preprocessor', self.preprocessor), ('model', model)])
-            pipeline.fit(X_train, y_train)
             
-            if self.model_type == "classification":
-                score = accuracy_score(y_test, pipeline.predict(X_test))
-                metric_name = "Accuracy"
+            # Use Cross Validation for robust scoring (prevents 100% overfitting illusion)
+            if len(X_train) > 50:
+                self.log(f"Validating {name} (5-Fold CV)...")
+                try:
+                    cv_scores = cross_val_score(pipeline, X_train, y_train, cv=5, scoring=scoring)
+                    score = cv_scores.mean()
+                    self.log(f"--> {name} Mean CV Score: {round(score, 4)}")
+                except:
+                    # Fallback if CV fails (e.g. rare classes)
+                    pipeline.fit(X_train, y_train)
+                    score = pipeline.score(X_test, y_test)
+                    self.log(f"--> {name} Test Score: {round(score, 4)}")
             else:
-                score = r2_score(y_test, pipeline.predict(X_test))
-                metric_name = "R2 Score"
-                
-            self.log(f"--> {name} Score: {round(score, 4)}")
+                # Small dataset fallback
+                pipeline.fit(X_train, y_train)
+                if self.model_type == "classification":
+                    score = accuracy_score(y_test, pipeline.predict(X_test))
+                else:
+                    score = r2_score(y_test, pipeline.predict(X_test))
+                self.log(f"--> {name} Score: {round(score, 4)}")
             
             if score > self.best_score:
                 self.best_score = score
                 self.best_model = pipeline
                 self.best_algo_name = name
                 
-        self.log(f"Step 5: Best Model Selected: {self.best_algo_name}")
+        # Final retrain on full training set
+        self.log(f"Step 5: Winner is {self.best_algo_name}. Retraining on full set...")
+        self.best_model.fit(X_train, y_train)
+        
+        # Final robust check on test set
+        final_test_score = 0
+        if self.model_type == "classification":
+            final_test_score = accuracy_score(y_test, self.best_model.predict(X_test))
+        else:
+            final_test_score = r2_score(y_test, self.best_model.predict(X_test))
+            
+        self.log(f"Final Test Set Score: {round(final_test_score * 100, 2)}%")
 
     def step_5_artifacts(self):
         self.log("Step 6: Saving Model & Code...")
@@ -324,7 +338,6 @@ def analyze_task(model_id: str, file_path: str):
         engineer.analyze_data_structure()
     except Exception as e:
         add_log(model_id, f"Analysis Error: {e}")
-        # Mark as failed in DB
         entry = next((item for item in projects_db if item["id"] == model_id), None)
         if entry: entry["status"] = "failed"
 
@@ -360,7 +373,7 @@ def get_logs(model_id: str):
     return {
         "logs": entry["logs"], 
         "status": entry["status"],
-        "analysis_result": entry.get("analysis_result"), # NEW: Send suggestions
+        "analysis_result": entry.get("analysis_result"),
         "artifacts": entry.get("artifacts", {}),
         "feature_metadata": entry.get("feature_metadata", [])
     }
@@ -384,14 +397,17 @@ def predict(model_id: str, req: PredictReq):
         artifact = joblib.load(path)
         model = artifact["pipeline"]
         le = artifact["le"]
-        df = pd.DataFrame([req.data])
+        
+        # Handle NaN/Nulls safely
+        safe_data = {k: (v if v != "" else np.nan) for k, v in req.data.items()}
+        df = pd.DataFrame([safe_data])
+        
         pred = model.predict(df)[0]
         if le: pred = le.inverse_transform([int(pred)])[0]
         return {"prediction": str(pred), "model_id": model_id}
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# --- STEP 1: UPLOAD ---
 @app.post("/upload")
 async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fid = str(uuid.uuid4())
@@ -401,15 +417,15 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
         
     mid = str(uuid.uuid4())
     entry = {
-        "id": mid, "name": filename, "status": "analyzing", # Initial status
+        "id": mid, "name": filename, "status": "analyzing",
         "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
-        "artifacts": {}, "file_path": path # Save path for later
+        "artifacts": {}, "feature_metadata": []
     }
     projects_db.insert(0, entry)
     bg_tasks.add_task(analyze_task, mid, path)
     return entry
 
-# --- STEP 2: START TRAINING ---
+# --- START TRAINING ---
 class TrainConfig(BaseModel):
     target: str
     drop_columns: List[str]
