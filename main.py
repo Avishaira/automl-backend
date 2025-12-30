@@ -275,7 +275,7 @@ class MLEngineer:
         for name, model in models:
             pipeline = Pipeline(steps=[('preprocessor', self.preprocessor), ('model', model)])
             
-            # Use Cross Validation for robust scoring (prevents 100% overfitting illusion)
+            # Use Cross Validation for robust scoring
             if len(X_train) > 50:
                 self.log(f"Validating {name} (5-Fold CV)...")
                 try:
@@ -283,12 +283,10 @@ class MLEngineer:
                     score = cv_scores.mean()
                     self.log(f"--> {name} Mean CV Score: {round(score, 4)}")
                 except:
-                    # Fallback if CV fails (e.g. rare classes)
                     pipeline.fit(X_train, y_train)
                     score = pipeline.score(X_test, y_test)
                     self.log(f"--> {name} Test Score: {round(score, 4)}")
             else:
-                # Small dataset fallback
                 pipeline.fit(X_train, y_train)
                 if self.model_type == "classification":
                     score = accuracy_score(y_test, pipeline.predict(X_test))
@@ -301,11 +299,9 @@ class MLEngineer:
                 self.best_model = pipeline
                 self.best_algo_name = name
                 
-        # Final retrain on full training set
         self.log(f"Step 5: Winner is {self.best_algo_name}. Retraining on full set...")
         self.best_model.fit(X_train, y_train)
         
-        # Final robust check on test set
         final_test_score = 0
         if self.model_type == "classification":
             final_test_score = accuracy_score(y_test, self.best_model.predict(X_test))
@@ -398,7 +394,6 @@ def predict(model_id: str, req: PredictReq):
         model = artifact["pipeline"]
         le = artifact["le"]
         
-        # Handle NaN/Nulls safely
         safe_data = {k: (v if v != "" else np.nan) for k, v in req.data.items()}
         df = pd.DataFrame([safe_data])
         
@@ -419,7 +414,8 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     entry = {
         "id": mid, "name": filename, "status": "analyzing",
         "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
-        "artifacts": {}, "feature_metadata": []
+        "artifacts": {}, "feature_metadata": [],
+        "file_path": path # <--- התיקון הקריטי כאן
     }
     projects_db.insert(0, entry)
     bg_tasks.add_task(analyze_task, mid, path)
@@ -443,4 +439,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
