@@ -16,7 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# ייבוא ספריות ה-AI וה-ML
 import google.generativeai as genai
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -28,19 +27,19 @@ from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.metrics import accuracy_score, r2_score, mean_absolute_error
 
-# --- הגדרות ---
+# --- CONFIGURATION ---
 UPLOAD_DIR = "uploads"
 ARTIFACTS_DIR = "artifacts"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-# הגדרת לוגים
+# Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoML_Brain")
 
 app = FastAPI(title="Gemini Expert AutoML")
 
-# אפשור גישה מכל דומיין (CORS)
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,12 +48,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- בסיס נתונים בזיכרון ---
-# מבנה: { id: str, status: str, logs: list[str], artifacts: dict, ... }
+# --- IN-MEMORY DATABASE ---
 projects_db = []
 
 def add_log(model_id: str, message: str):
-    """פונקציית עזר לכתיבת לוגים לפרויקט ספציפי"""
+    """Helper to push logs to the specific project"""
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     if entry:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -62,21 +60,19 @@ def add_log(model_id: str, message: str):
         entry["logs"].append(log_entry)
         logger.info(f"Project {model_id}: {message}")
 
-# --- המוח של GEMINI ---
+# --- GEMINI BRAIN ---
 class GeminiBrain:
     def __init__(self):
         self.api_key = os.environ.get("GOOGLE_API_KEY")
         if self.api_key:
             genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-2.0-flash') # מודל מהיר וחכם
+            self.model = genai.GenerativeModel('gemini-2.0-flash')
             self.active = True
         else:
             self.active = False
 
     def analyze(self, df_head_csv):
-        """שולח את דגימת הנתונים לניתוח אסטרטגי"""
         if not self.active: return None
-        
         prompt = f"""
         Act as a Senior Data Scientist. Analyze this dataset sample (CSV):
         {df_head_csv}
@@ -103,21 +99,21 @@ class GeminiBrain:
         except:
             return None
 
-# --- מהנדס ה-ML האוטומטי ---
+# --- THE ML ENGINEER ENGINE ---
 class MLEngineer:
     def __init__(self, model_id, filepath):
         self.model_id = model_id
         self.filepath = filepath
         self.brain = GeminiBrain()
         self.df = pd.read_csv(filepath)
-        self.artifacts = {} # נתיבים לקבצים שנשמרו
+        self.artifacts = {} 
         self.strategy = {}
         self.best_model = None
         self.best_score = -np.inf
         self.best_algo_name = ""
         self.target = None
         self.model_type = None
-        self.le = None # Label Encoder
+        self.le = None
         
     def log(self, msg):
         add_log(self.model_id, msg)
@@ -139,62 +135,57 @@ class MLEngineer:
             self.target = ai_advice.get('target')
             self.model_type = ai_advice.get('type').lower()
         else:
-            self.log("AI unavailable (Key missing?), using heuristic backup.")
+            self.log("AI unavailable, using heuristic backup.")
             self.target = self.df.columns[-1]
             self.model_type = "classification" if self.df[self.target].nunique() < 20 else "regression"
             self.strategy = {"split_ratio": 0.2, "cleaning_notes": "Standard Auto-Imputation"}
             
-        # ולידציה שהעמודה קיימת
         if self.target not in self.df.columns:
             self.target = self.df.columns[-1]
-            self.log(f"Correction: Target set to last column '{self.target}'")
+            self.log(f"Correction: Target set to '{self.target}'")
 
     def step_2_cleaning(self):
         self.log("Step 2: Performing Data Cleaning & Engineering...")
         self.log(f"AI Cleaning Strategy: {self.strategy.get('cleaning_notes', 'Auto')}")
         
-        # שמירת הקובץ המקורי
+        # Save Original
         orig_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_original.csv")
         self.df.to_csv(orig_path, index=False)
         self.artifacts["original_data"] = orig_path
         
-        # הפרדת משתנים
         X = self.df.drop(columns=[self.target])
         y = self.df[self.target]
         
-        # קידוד משתנה המטרה אם הוא טקסט (עבור סיווג)
+        # Label Encode Target if Classification
+        self.le = None
         if self.model_type == "classification" and y.dtype == 'object':
             self.log("Encoding target variable labels to numbers...")
             self.le = LabelEncoder()
             y = self.le.fit_transform(y)
             
-        # הגדרת הצינור (Pipeline) לעיבוד נתונים
         numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
         categorical_features = X.select_dtypes(include=['object', 'bool']).columns
         
         self.log(f"Detected {len(numeric_features)} numeric and {len(categorical_features)} categorical features.")
         
-        # יצירת טרנספורמרים
         self.preprocessor = ColumnTransformer(
             transformers=[
                 ('num', Pipeline([
-                    ('imputer', SimpleImputer(strategy='median')), # השלמת חסרים במספרים
-                    ('scaler', StandardScaler()) # נרמול
+                    ('imputer', SimpleImputer(strategy='median')),
+                    ('scaler', StandardScaler())
                 ]), numeric_features),
                 ('cat', Pipeline([
-                    ('imputer', SimpleImputer(strategy='most_frequent')), # השלמת חסרים בטקסט
-                    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False)) # המרת טקסט לבינארי
+                    ('imputer', SimpleImputer(strategy='most_frequent')),
+                    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
                 ]), categorical_features)
             ], verbose_feature_names_out=False)
             
-        # ביצוע הניקוי בפועל
         self.log("Applying transformations...")
         X_processed = self.preprocessor.fit_transform(X)
         
-        # שמירת הקובץ הנקי (משוחזר לדאטה-פריים)
+        # Save Cleaned Data
         clean_df = pd.DataFrame(X_processed)
-        # הוספת עמודת המטרה חזרה כדי שהקובץ יהיה שלם
-        clean_df['TARGET'] = y 
+        clean_df['TARGET'] = y
         clean_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_cleaned.csv")
         clean_df.to_csv(clean_path, index=False)
         self.artifacts["cleaned_data"] = clean_path
@@ -208,7 +199,7 @@ class MLEngineer:
         
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=ratio, random_state=42)
         
-        # שמירת קבצי אימון ובדיקה
+        # Save Splits
         train_df = pd.concat([X_train, pd.Series(y_train, name=self.target, index=X_train.index)], axis=1)
         test_df = pd.concat([X_test, pd.Series(y_test, name=self.target, index=X_test.index)], axis=1)
         
@@ -228,7 +219,6 @@ class MLEngineer:
         self.log("Step 4: Starting Model Tournament...")
         
         models = []
-        # בחירת מודלים לפי סוג הבעיה
         if self.model_type == "classification":
             models = [
                 ("Random Forest", RandomForestClassifier(n_estimators=100)),
@@ -245,9 +235,8 @@ class MLEngineer:
             ]
             
         for name, model in models:
-            self.log(f"Training {name} with default hyperparameters...")
+            self.log(f"Training {name}...")
             pipeline = Pipeline(steps=[('preprocessor', self.preprocessor), ('model', model)])
-            
             pipeline.fit(X_train, y_train)
             
             if self.model_type == "classification":
@@ -257,115 +246,70 @@ class MLEngineer:
                 score = r2_score(y_test, pipeline.predict(X_test))
                 metric_name = "R2 Score"
                 
-            self.log(f"--> {name} Result: {metric_name} = {round(score, 4)}")
+            self.log(f"--> {name}: {metric_name} = {round(score, 4)}")
             
             if score > self.best_score:
                 self.best_score = score
                 self.best_model = pipeline
                 self.best_algo_name = name
                 
-        self.log(f"Step 5: Tournament Winner Identified: {self.best_algo_name}")
-        self.log(f"Final Accuracy/Score: {round(self.best_score * 100, 2)}%")
+        self.log(f"Step 5: Winner Identified: {self.best_algo_name}")
+        self.log(f"Final Score: {round(self.best_score * 100, 2)}%")
 
     def step_5_artifacts(self):
         self.log("Step 6: Generating deployment artifacts...")
         
-        # שמירת המודל הבינארי (.pkl)
+        # Save Model
         model_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_model.pkl")
         joblib.dump({"pipeline": self.best_model, "le": self.le}, model_path)
         self.artifacts["model_file"] = model_path
         
-        # יצירת קוד Python מלא לשחזור
+        # Generate Code
         code = f"""
-# Reproducible Machine Learning Script
-# Generated by AI Master Engineer
-# ----------------------------------
-# Problem Type: {self.model_type}
-# Target Variable: {self.target}
+import pandas as pd
+import numpy as np
+import joblib
+# ... imports ...
+
 # Best Model: {self.best_algo_name}
 # Score: {round(self.best_score, 4)}
 
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.metrics import accuracy_score, r2_score
-
-# 1. Load Data
-# Ensure you have 'dataset.csv' in the same folder
-print("Loading dataset...")
+# Load Data
 df = pd.read_csv('dataset.csv')
-
 X = df.drop(columns=['{self.target}'])
 y = df['{self.target}']
 
-# 2. Preprocessing
-print("Preprocessing data...")
-numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
-categorical_features = X.select_dtypes(include=['object', 'bool']).columns
+# Load Model Pipeline (includes scaling/encoding)
+model_data = joblib.load('{self.model_id}_model.pkl')
+pipeline = model_data['pipeline']
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler())
-        ]), numeric_features),
-        ('cat', Pipeline([
-            ('imputer', SimpleImputer(strategy='most_frequent')),
-            ('onehot', OneHotEncoder(handle_unknown='ignore'))
-        ]), categorical_features)
-    ])
-
-# 3. Model Definition ({self.best_algo_name})
-model = {self.best_model.named_steps['model']}
-
-pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('model', model)])
-
-# 4. Train
-print("Training model...")
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size={self.strategy.get('split_ratio', 0.2)}, random_state=42)
-pipeline.fit(X_train, y_train)
-
-# 5. Evaluate
-print("Evaluating...")
-score = pipeline.score(X_test, y_test)
-print(f"Final Score: {{score}}")
+# Predict
+print("Predicting...")
+# preds = pipeline.predict(X)
 """
         code_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_code.py")
-        with open(code_path, "w") as f:
-            f.write(code)
+        with open(code_path, "w") as f: f.write(code)
         self.artifacts["code_file"] = code_path
-        self.log("Full Python code generated successfully.")
+        self.log("Python code generated.")
 
-# --- ניהול הריצה ---
 def run_pipeline(model_id: str, file_path: str):
     engineer = MLEngineer(model_id, file_path)
-    
-    # איתור הפרויקט בזיכרון
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     
     try:
-        # הרצת השלבים
         engineer.step_1_analysis()
         X, y = engineer.step_2_cleaning()
         X_train, X_test, y_train, y_test = engineer.step_3_splitting(X, y)
         engineer.step_4_training(X_train, X_test, y_train, y_test)
         engineer.step_5_artifacts()
         
-        # עדכון סיום
         if entry:
             entry["status"] = "completed"
             entry["accuracy"] = f"{round(engineer.best_score * 100, 2)}%"
-            entry["artifacts"] = engineer.artifacts # שמירת הנתיבים להורדה
+            entry["artifacts"] = engineer.artifacts
             
     except Exception as e:
-        engineer.log(f"CRITICAL ERROR: {str(e)}")
+        engineer.log(f"ERROR: {str(e)}")
         logger.error(traceback.format_exc())
         if entry:
             entry["status"] = "failed"
@@ -379,25 +323,42 @@ def health(): return {"status": "online"}
 @app.get("/models")
 def get_models(): return {"models": projects_db}
 
-# Endpoint שמחזיר לוגים בזמן אמת ל-Frontend
 @app.get("/models/{model_id}/logs")
 def get_logs(model_id: str):
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     if not entry: raise HTTPException(404, "Model not found")
     return {"logs": entry["logs"], "status": entry["status"], "artifacts": entry.get("artifacts", {})}
 
-# Endpoint להורדת קבצים
 @app.get("/download/{model_id}/{file_type}")
 def download_file(model_id: str, file_type: str):
     entry = next((item for item in projects_db if item["id"] == model_id), None)
-    if not entry or "artifacts" not in entry:
-        raise HTTPException(404, "Artifacts not ready")
-        
-    path = entry["artifacts"].get(file_type) # original_data, cleaned_data, train_data, test_data, code_file, model_file
-    if not path or not os.path.exists(path):
-        raise HTTPException(404, "File not found")
-        
+    if not entry or "artifacts" not in entry: raise HTTPException(404, "Artifacts not ready")
+    path = entry["artifacts"].get(file_type)
+    if not path or not os.path.exists(path): raise HTTPException(404, "File not found")
     return FileResponse(path, filename=os.path.basename(path))
+
+# --- PREDICTION ENDPOINT ---
+class PredictReq(BaseModel):
+    data: Dict[str, Any]
+
+@app.post("/predict/{model_id}")
+def predict(model_id: str, req: PredictReq):
+    path = os.path.join(ARTIFACTS_DIR, f"{model_id}_model.pkl")
+    if not os.path.exists(path): raise HTTPException(404, "Model not ready")
+    
+    try:
+        artifact = joblib.load(path)
+        model = artifact["pipeline"]
+        le = artifact["le"]
+        
+        df = pd.DataFrame([req.data])
+        pred = model.predict(df)[0]
+        
+        if le: pred = le.inverse_transform([int(pred)])[0]
+            
+        return {"prediction": str(pred), "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.post("/upload")
 async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -405,22 +366,15 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     filename = file.filename.replace(" ", "_")
     path = os.path.join(UPLOAD_DIR, f"{fid}_{filename}")
     
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
         
     mid = str(uuid.uuid4())
     entry = {
-        "id": mid,
-        "name": filename,
-        "status": "training",
-        "accuracy": None,
-        "logs": [],
-        "created_at": datetime.datetime.now().strftime("%H:%M"),
+        "id": mid, "name": filename, "status": "training",
+        "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"),
         "artifacts": {}
     }
     projects_db.insert(0, entry)
-    
-    # התחלת האימון ברקע
     bg_tasks.add_task(run_pipeline, mid, path)
     return entry
 
