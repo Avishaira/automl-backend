@@ -157,7 +157,7 @@ class MLEngineer:
         
         self.log(f"User Confirmed Target: '{self.target}'")
         if drops:
-            self.log(f"Dropping columns: {drops}")
+            self.log(f"Dropping columns based on user selection: {len(drops)} columns")
             self.df = self.df.drop(columns=[c for c in drops if c in self.df.columns])
             
         # Re-eval type based on final target
@@ -191,16 +191,25 @@ class MLEngineer:
         for col in X.columns:
             col_data = X[col]
             meta = {"name": col}
-            if pd.api.types.is_numeric_dtype(col_data):
+            
+            # --- INTELLIGENT TYPE DETECTION FOR UI ---
+            unique_count = col_data.nunique()
+            is_numeric = pd.api.types.is_numeric_dtype(col_data)
+            
+            # If numeric but has very few unique values (e.g. 1, 2, 3), treat as categorical dropdown
+            # This prevents entering "1.34" for discrete variables
+            if is_numeric and unique_count > 15:
                 meta["type"] = "number"
                 meta["min"] = float(col_data.min()) if not pd.isna(col_data.min()) else 0
                 meta["max"] = float(col_data.max()) if not pd.isna(col_data.max()) else 100
                 meta["default"] = float(round(col_data.mean(), 2)) if not pd.isna(col_data.mean()) else 0
             else:
                 meta["type"] = "categorical"
-                unique_vals = col_data.astype(str).unique().tolist()
-                meta["options"] = unique_vals[:50]
-                meta["default"] = unique_vals[0] if unique_vals else ""
+                # Convert to string to ensure dropdown consistency
+                unique_vals = sorted(col_data.unique().tolist())
+                meta["options"] = [str(v) for v in unique_vals][:50] # Limit size
+                meta["default"] = str(unique_vals[0]) if unique_vals else ""
+            
             self.feature_metadata.append(meta)
         
         # Cleaning Logic
@@ -234,8 +243,9 @@ class MLEngineer:
         return X, y
 
     def step_3_splitting(self, X, y):
-        self.log("Step 3: Splitting Train/Test Sets...")
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        ratio = self.strategy.get("split_ratio", 0.2)
+        self.log(f"Step 3: Splitting Data ({int((1-ratio)*100)}% Train / {int(ratio*100)}% Test)...")
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=ratio, random_state=42)
         
         train_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_train.csv")
         test_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_test.csv")
@@ -276,8 +286,10 @@ class MLEngineer:
             
             if self.model_type == "classification":
                 score = accuracy_score(y_test, pipeline.predict(X_test))
+                metric_name = "Accuracy"
             else:
                 score = r2_score(y_test, pipeline.predict(X_test))
+                metric_name = "R2 Score"
                 
             self.log(f"--> {name} Score: {round(score, 4)}")
             
