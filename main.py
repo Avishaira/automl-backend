@@ -52,7 +52,6 @@ app.add_middleware(
 projects_db = []
 
 def add_log(model_id: str, message: str):
-    """Helper to push logs to the specific project"""
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     if entry:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -81,15 +80,14 @@ class GeminiBrain:
         1. Target Column (prediction label).
         2. Problem Type (Classification/Regression).
         3. Split Strategy (e.g., 80/20, 70/30).
-        4. Cleaning Strategy (Imputation methods).
+        4. Cleaning Strategy.
         
         Return JSON ONLY:
         {{
             "target": "col_name",
             "type": "classification" or "regression",
             "split_ratio": 0.2,
-            "cleaning_notes": "string explanation",
-            "recommended_models": ["RandomForest", "GradientBoosting"]
+            "cleaning_notes": "string explanation"
         }}
         """
         try:
@@ -99,7 +97,7 @@ class GeminiBrain:
         except:
             return None
 
-# --- THE ML ENGINEER ENGINE ---
+# --- ML ENGINEER ---
 class MLEngineer:
     def __init__(self, model_id, filepath):
         self.model_id = model_id
@@ -114,23 +112,20 @@ class MLEngineer:
         self.target = None
         self.model_type = None
         self.le = None
+        self.feature_metadata = [] # NEW: Store form structure here
         
     def log(self, msg):
         add_log(self.model_id, msg)
 
     def step_1_analysis(self):
         self.log("Step 1: Reading dataset and scanning variables...")
-        self.log(f"Dataset shape: {self.df.shape[0]} rows, {self.df.shape[1]} columns.")
-        
         head_csv = self.df.head(5).to_csv(index=False)
-        self.log("Sending data sample to Gemini AI for strategic analysis...")
+        self.log("Sending data to AI for analysis...")
         
         ai_advice = self.brain.analyze(head_csv)
         
         if ai_advice:
             self.log("AI Analysis Complete.")
-            self.log(f"Decided Target Variable: '{ai_advice.get('target')}'")
-            self.log(f"Problem Type Identified: {ai_advice.get('type').upper()}")
             self.strategy = ai_advice
             self.target = ai_advice.get('target')
             self.model_type = ai_advice.get('type').lower()
@@ -138,15 +133,14 @@ class MLEngineer:
             self.log("AI unavailable, using heuristic backup.")
             self.target = self.df.columns[-1]
             self.model_type = "classification" if self.df[self.target].nunique() < 20 else "regression"
-            self.strategy = {"split_ratio": 0.2, "cleaning_notes": "Standard Auto-Imputation"}
+            self.strategy = {"split_ratio": 0.2}
             
         if self.target not in self.df.columns:
             self.target = self.df.columns[-1]
             self.log(f"Correction: Target set to '{self.target}'")
 
     def step_2_cleaning(self):
-        self.log("Step 2: Performing Data Cleaning & Engineering...")
-        self.log(f"AI Cleaning Strategy: {self.strategy.get('cleaning_notes', 'Auto')}")
+        self.log("Step 2: Performing Data Cleaning & Feature Extraction...")
         
         # Save Original
         orig_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_original.csv")
@@ -155,18 +149,37 @@ class MLEngineer:
         
         X = self.df.drop(columns=[self.target])
         y = self.df[self.target]
+
+        # --- NEW: Extract Metadata for UI Form ---
+        self.log("Analyzing independent variables for UI generation...")
+        for col in X.columns:
+            col_data = X[col]
+            meta = {"name": col}
+            
+            # Check if numeric
+            if pd.api.types.is_numeric_dtype(col_data):
+                meta["type"] = "number"
+                # Use clean float values for JSON serialization
+                meta["min"] = float(col_data.min()) if not pd.isna(col_data.min()) else 0
+                meta["max"] = float(col_data.max()) if not pd.isna(col_data.max()) else 100
+                mean_val = float(col_data.mean()) if not pd.isna(col_data.mean()) else 0
+                meta["default"] = round(mean_val, 2)
+            else:
+                meta["type"] = "categorical"
+                # Get unique values (limit to 50 to avoid massive lists)
+                unique_vals = col_data.astype(str).unique().tolist()
+                meta["options"] = unique_vals[:50]
+                meta["default"] = unique_vals[0] if unique_vals else ""
+            
+            self.feature_metadata.append(meta)
         
-        # Label Encode Target if Classification
-        self.le = None
+        # --- Continue Cleaning ---
         if self.model_type == "classification" and y.dtype == 'object':
-            self.log("Encoding target variable labels to numbers...")
             self.le = LabelEncoder()
             y = self.le.fit_transform(y)
             
         numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
         categorical_features = X.select_dtypes(include=['object', 'bool']).columns
-        
-        self.log(f"Detected {len(numeric_features)} numeric and {len(categorical_features)} categorical features.")
         
         self.preprocessor = ColumnTransformer(
             transformers=[
@@ -180,7 +193,6 @@ class MLEngineer:
                 ]), categorical_features)
             ], verbose_feature_names_out=False)
             
-        self.log("Applying transformations...")
         X_processed = self.preprocessor.fit_transform(X)
         
         # Save Cleaned Data
@@ -196,22 +208,17 @@ class MLEngineer:
     def step_3_splitting(self, X, y):
         ratio = self.strategy.get("split_ratio", 0.2)
         self.log(f"Step 3: Splitting Dataset. Train: {int((1-ratio)*100)}% | Test: {int(ratio*100)}%")
-        
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=ratio, random_state=42)
         
         # Save Splits
-        train_df = pd.concat([X_train, pd.Series(y_train, name=self.target, index=X_train.index)], axis=1)
-        test_df = pd.concat([X_test, pd.Series(y_test, name=self.target, index=X_test.index)], axis=1)
-        
         train_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_train.csv")
         test_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_test.csv")
         
-        train_df.to_csv(train_path, index=False)
-        test_df.to_csv(test_path, index=False)
+        pd.concat([X_train, pd.Series(y_train, name='target', index=X_train.index)], axis=1).to_csv(train_path, index=False)
+        pd.concat([X_test, pd.Series(y_test, name='target', index=X_test.index)], axis=1).to_csv(test_path, index=False)
         
         self.artifacts["train_data"] = train_path
         self.artifacts["test_data"] = test_path
-        self.log("Saved 'train.csv' and 'test.csv'.")
         
         return X_train, X_test, y_train, y_test
 
@@ -224,14 +231,14 @@ class MLEngineer:
                 ("Random Forest", RandomForestClassifier(n_estimators=100)),
                 ("Gradient Boosting", GradientBoostingClassifier()),
                 ("Logistic Regression", LogisticRegression(max_iter=1000)),
-                ("K-Nearest Neighbors", KNeighborsClassifier())
+                ("KNN", KNeighborsClassifier())
             ]
         else:
             models = [
-                ("Random Forest Regressor", RandomForestRegressor(n_estimators=100)),
-                ("Gradient Boosting Regressor", GradientBoostingRegressor()),
+                ("Random Forest", RandomForestRegressor(n_estimators=100)),
+                ("Gradient Boosting", GradientBoostingRegressor()),
                 ("Linear Regression", LinearRegression()),
-                ("KNN Regressor", KNeighborsRegressor())
+                ("KNN", KNeighborsRegressor())
             ]
             
         for name, model in models:
@@ -253,44 +260,41 @@ class MLEngineer:
                 self.best_model = pipeline
                 self.best_algo_name = name
                 
-        self.log(f"Step 5: Winner Identified: {self.best_algo_name}")
-        self.log(f"Final Score: {round(self.best_score * 100, 2)}%")
+        self.log(f"Step 5: Best Model Selected: {self.best_algo_name} ({round(self.best_score * 100, 2)}%)")
 
     def step_5_artifacts(self):
         self.log("Step 6: Generating deployment artifacts...")
         
-        # Save Model
         model_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_model.pkl")
         joblib.dump({"pipeline": self.best_model, "le": self.le}, model_path)
         self.artifacts["model_file"] = model_path
         
-        # Generate Code
         code = f"""
 import pandas as pd
-import numpy as np
 import joblib
+from sklearn.model_selection import train_test_split
 # ... imports ...
 
-# Best Model: {self.best_algo_name}
-# Score: {round(self.best_score, 4)}
+# Model: {self.best_algo_name}
+# Target: {self.target}
 
-# Load Data
+# 1. Load Data
 df = pd.read_csv('dataset.csv')
 X = df.drop(columns=['{self.target}'])
 y = df['{self.target}']
 
-# Load Model Pipeline (includes scaling/encoding)
+# 2. Load Pipeline
 model_data = joblib.load('{self.model_id}_model.pkl')
 pipeline = model_data['pipeline']
 
-# Predict
-print("Predicting...")
+# 3. Predict
 # preds = pipeline.predict(X)
+print("Model loaded.")
 """
         code_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_code.py")
         with open(code_path, "w") as f: f.write(code)
         self.artifacts["code_file"] = code_path
-        self.log("Python code generated.")
+        self.log("Code generated.")
 
 def run_pipeline(model_id: str, file_path: str):
     engineer = MLEngineer(model_id, file_path)
@@ -307,6 +311,9 @@ def run_pipeline(model_id: str, file_path: str):
             entry["status"] = "completed"
             entry["accuracy"] = f"{round(engineer.best_score * 100, 2)}%"
             entry["artifacts"] = engineer.artifacts
+            entry["target_col"] = engineer.target
+            # IMPORTANT: Save the extracted metadata so Frontend can build the form
+            entry["feature_metadata"] = engineer.feature_metadata
             
     except Exception as e:
         engineer.log(f"ERROR: {str(e)}")
@@ -327,17 +334,21 @@ def get_models(): return {"models": projects_db}
 def get_logs(model_id: str):
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     if not entry: raise HTTPException(404, "Model not found")
-    return {"logs": entry["logs"], "status": entry["status"], "artifacts": entry.get("artifacts", {})}
+    return {
+        "logs": entry["logs"], 
+        "status": entry["status"], 
+        "artifacts": entry.get("artifacts", {}),
+        "feature_metadata": entry.get("feature_metadata", []) # Send metadata to frontend
+    }
 
 @app.get("/download/{model_id}/{file_type}")
 def download_file(model_id: str, file_type: str):
     entry = next((item for item in projects_db if item["id"] == model_id), None)
-    if not entry or "artifacts" not in entry: raise HTTPException(404, "Artifacts not ready")
+    if not entry: raise HTTPException(404, "Not found")
     path = entry["artifacts"].get(file_type)
     if not path or not os.path.exists(path): raise HTTPException(404, "File not found")
     return FileResponse(path, filename=os.path.basename(path))
 
-# --- PREDICTION ENDPOINT ---
 class PredictReq(BaseModel):
     data: Dict[str, Any]
 
@@ -365,14 +376,13 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fid = str(uuid.uuid4())
     filename = file.filename.replace(" ", "_")
     path = os.path.join(UPLOAD_DIR, f"{fid}_{filename}")
-    
     with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
         
     mid = str(uuid.uuid4())
     entry = {
-        "id": mid, "name": filename, "status": "training",
-        "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"),
-        "artifacts": {}
+        "id": mid, "name": filename, "status": "training", "accuracy": None, 
+        "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
+        "artifacts": {}, "feature_metadata": []
     }
     projects_db.insert(0, entry)
     bg_tasks.add_task(run_pipeline, mid, path)
