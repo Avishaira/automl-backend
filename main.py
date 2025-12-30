@@ -39,7 +39,6 @@ logger = logging.getLogger("AutoML_Brain")
 
 app = FastAPI(title="Gemini Expert AutoML")
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,22 +71,22 @@ class GeminiBrain:
 
     def analyze(self, df_head_csv):
         if not self.active: return None
+        
         prompt = f"""
-        Act as a Senior Data Scientist. Analyze this dataset sample (CSV):
+        Act as a Data Scientist. Analyze this CSV sample:
         {df_head_csv}
         
-        Decide:
+        Recommend:
         1. Target Column (prediction label).
-        2. Problem Type (Classification/Regression).
-        3. Split Strategy (e.g., 80/20, 70/30).
-        4. Cleaning Strategy.
+        2. Columns to DROP (ID, Name, Date, Unstructured text).
+        3. Problem Type (Classification/Regression).
         
         Return JSON ONLY:
         {{
             "target": "col_name",
+            "drop_columns": ["col_1", "col_2"],
             "type": "classification" or "regression",
-            "split_ratio": 0.2,
-            "cleaning_notes": "string explanation"
+            "reasoning": "explanation"
         }}
         """
         try:
@@ -112,37 +111,74 @@ class MLEngineer:
         self.target = None
         self.model_type = None
         self.le = None
-        self.feature_metadata = [] # NEW: Store form structure here
+        self.feature_metadata = [] 
         
     def log(self, msg):
         add_log(self.model_id, msg)
 
-    def step_1_analysis(self):
-        self.log("Step 1: Reading dataset and scanning variables...")
-        head_csv = self.df.head(5).to_csv(index=False)
-        self.log("Sending data to AI for analysis...")
+    # --- STEP 1: INITIAL ANALYSIS (PRE-APPROVAL) ---
+    def analyze_data_structure(self):
+        self.log("Step 1: Scanning dataset structure...")
         
+        columns = list(self.df.columns)
+        head_csv = self.df.head(5).to_csv(index=False)
+        
+        self.log("Consulting Gemini AI for recommendations...")
         ai_advice = self.brain.analyze(head_csv)
         
+        suggestion = {
+            "all_columns": columns,
+            "target": columns[-1], # Default
+            "drop_columns": [],
+            "type": "regression",
+            "reasoning": "Automatic heuristic"
+        }
+
         if ai_advice:
-            self.log("AI Analysis Complete.")
-            self.strategy = ai_advice
-            self.target = ai_advice.get('target')
-            self.model_type = ai_advice.get('type').lower()
+            self.log("AI Recommendations Received.")
+            suggestion["target"] = ai_advice.get("target", columns[-1])
+            suggestion["drop_columns"] = ai_advice.get("drop_columns", [])
+            suggestion["type"] = ai_advice.get("type", "regression").lower()
+            suggestion["reasoning"] = ai_advice.get("reasoning", "")
         else:
-            self.log("AI unavailable, using heuristic backup.")
-            self.target = self.df.columns[-1]
-            self.model_type = "classification" if self.df[self.target].nunique() < 20 else "regression"
-            self.strategy = {"split_ratio": 0.2}
+            self.log("AI unavailable. Waiting for user input.")
             
-        if self.target not in self.df.columns:
-            self.target = self.df.columns[-1]
-            self.log(f"Correction: Target set to '{self.target}'")
+        # Update DB with suggestions so Frontend can show them
+        entry = next((item for item in projects_db if item["id"] == self.model_id), None)
+        if entry:
+            entry["analysis_result"] = suggestion
+            entry["status"] = "pending_approval"
+            self.log("Waiting for user approval on variables...")
+
+    # --- STEP 2: EXECUTION (POST-APPROVAL) ---
+    def execute_training(self, user_config):
+        self.target = user_config.get("target")
+        drops = user_config.get("drop_columns", [])
+        
+        self.log(f"User Confirmed Target: '{self.target}'")
+        if drops:
+            self.log(f"Dropping columns: {drops}")
+            self.df = self.df.drop(columns=[c for c in drops if c in self.df.columns])
+            
+        # Re-eval type based on final target
+        y = self.df[self.target]
+        if y.dtype == 'object' or y.nunique() < 20:
+            self.model_type = "classification"
+        else:
+            self.model_type = "regression"
+            
+        self.log(f"Task Type: {self.model_type.upper()}")
+        
+        # Chain remaining steps
+        X, y = self.step_2_cleaning()
+        X_train, X_test, y_train, y_test = self.step_3_splitting(X, y)
+        self.step_4_training(X_train, X_test, y_train, y_test)
+        self.step_5_artifacts()
 
     def step_2_cleaning(self):
-        self.log("Step 2: Performing Data Cleaning & Feature Extraction...")
+        self.log("Step 2: Data Cleaning & Feature Engineering...")
         
-        # Save Original
+        # Save Original (Cleaned of drops)
         orig_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_original.csv")
         self.df.to_csv(orig_path, index=False)
         self.artifacts["original_data"] = orig_path
@@ -150,30 +186,24 @@ class MLEngineer:
         X = self.df.drop(columns=[self.target])
         y = self.df[self.target]
 
-        # --- NEW: Extract Metadata for UI Form ---
-        self.log("Analyzing independent variables for UI generation...")
+        # Extract Metadata for UI Form
+        self.feature_metadata = []
         for col in X.columns:
             col_data = X[col]
             meta = {"name": col}
-            
-            # Check if numeric
             if pd.api.types.is_numeric_dtype(col_data):
                 meta["type"] = "number"
-                # Use clean float values for JSON serialization
                 meta["min"] = float(col_data.min()) if not pd.isna(col_data.min()) else 0
                 meta["max"] = float(col_data.max()) if not pd.isna(col_data.max()) else 100
-                mean_val = float(col_data.mean()) if not pd.isna(col_data.mean()) else 0
-                meta["default"] = round(mean_val, 2)
+                meta["default"] = float(round(col_data.mean(), 2)) if not pd.isna(col_data.mean()) else 0
             else:
                 meta["type"] = "categorical"
-                # Get unique values (limit to 50 to avoid massive lists)
                 unique_vals = col_data.astype(str).unique().tolist()
                 meta["options"] = unique_vals[:50]
                 meta["default"] = unique_vals[0] if unique_vals else ""
-            
             self.feature_metadata.append(meta)
         
-        # --- Continue Cleaning ---
+        # Cleaning Logic
         if self.model_type == "classification" and y.dtype == 'object':
             self.le = LabelEncoder()
             y = self.le.fit_transform(y)
@@ -195,35 +225,33 @@ class MLEngineer:
             
         X_processed = self.preprocessor.fit_transform(X)
         
-        # Save Cleaned Data
         clean_df = pd.DataFrame(X_processed)
         clean_df['TARGET'] = y
         clean_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_cleaned.csv")
         clean_df.to_csv(clean_path, index=False)
         self.artifacts["cleaned_data"] = clean_path
-        self.log("Saved 'cleaned_dataset.csv'.")
         
         return X, y
 
     def step_3_splitting(self, X, y):
-        ratio = self.strategy.get("split_ratio", 0.2)
-        self.log(f"Step 3: Splitting Dataset. Train: {int((1-ratio)*100)}% | Test: {int(ratio*100)}%")
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=ratio, random_state=42)
+        self.log("Step 3: Splitting Train/Test Sets...")
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
-        # Save Splits
         train_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_train.csv")
         test_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_test.csv")
         
-        pd.concat([X_train, pd.Series(y_train, name='target', index=X_train.index)], axis=1).to_csv(train_path, index=False)
-        pd.concat([X_test, pd.Series(y_test, name='target', index=X_test.index)], axis=1).to_csv(test_path, index=False)
-        
-        self.artifacts["train_data"] = train_path
-        self.artifacts["test_data"] = test_path
+        # Save artifacts
+        try:
+            pd.concat([X_train, pd.Series(y_train, name='target', index=X_train.index)], axis=1).to_csv(train_path, index=False)
+            pd.concat([X_test, pd.Series(y_test, name='target', index=X_test.index)], axis=1).to_csv(test_path, index=False)
+            self.artifacts["train_data"] = train_path
+            self.artifacts["test_data"] = test_path
+        except: pass
         
         return X_train, X_test, y_train, y_test
 
     def step_4_training(self, X_train, X_test, y_train, y_test):
-        self.log("Step 4: Starting Model Tournament...")
+        self.log("Step 4: Running Model Tournament...")
         
         models = []
         if self.model_type == "classification":
@@ -248,22 +276,20 @@ class MLEngineer:
             
             if self.model_type == "classification":
                 score = accuracy_score(y_test, pipeline.predict(X_test))
-                metric_name = "Accuracy"
             else:
                 score = r2_score(y_test, pipeline.predict(X_test))
-                metric_name = "R2 Score"
                 
-            self.log(f"--> {name}: {metric_name} = {round(score, 4)}")
+            self.log(f"--> {name} Score: {round(score, 4)}")
             
             if score > self.best_score:
                 self.best_score = score
                 self.best_model = pipeline
                 self.best_algo_name = name
                 
-        self.log(f"Step 5: Best Model Selected: {self.best_algo_name} ({round(self.best_score * 100, 2)}%)")
+        self.log(f"Step 5: Best Model Selected: {self.best_algo_name}")
 
     def step_5_artifacts(self):
-        self.log("Step 6: Generating deployment artifacts...")
+        self.log("Step 6: Saving Model & Code...")
         
         model_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_model.pkl")
         joblib.dump({"pipeline": self.best_model, "le": self.le}, model_path)
@@ -272,55 +298,40 @@ class MLEngineer:
         code = f"""
 import pandas as pd
 import joblib
-from sklearn.model_selection import train_test_split
-# ... imports ...
-
 # Model: {self.best_algo_name}
 # Target: {self.target}
-
-# 1. Load Data
-df = pd.read_csv('dataset.csv')
-X = df.drop(columns=['{self.target}'])
-y = df['{self.target}']
-
-# 2. Load Pipeline
-model_data = joblib.load('{self.model_id}_model.pkl')
-pipeline = model_data['pipeline']
-
-# 3. Predict
-# preds = pipeline.predict(X)
-print("Model loaded.")
 """
         code_path = os.path.join(ARTIFACTS_DIR, f"{self.model_id}_code.py")
         with open(code_path, "w") as f: f.write(code)
         self.artifacts["code_file"] = code_path
-        self.log("Code generated.")
 
-def run_pipeline(model_id: str, file_path: str):
+# --- TASKS ---
+def analyze_task(model_id: str, file_path: str):
+    engineer = MLEngineer(model_id, file_path)
+    try:
+        engineer.analyze_data_structure()
+    except Exception as e:
+        add_log(model_id, f"Analysis Error: {e}")
+        # Mark as failed in DB
+        entry = next((item for item in projects_db if item["id"] == model_id), None)
+        if entry: entry["status"] = "failed"
+
+def training_task(model_id: str, file_path: str, config: dict):
     engineer = MLEngineer(model_id, file_path)
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     
     try:
-        engineer.step_1_analysis()
-        X, y = engineer.step_2_cleaning()
-        X_train, X_test, y_train, y_test = engineer.step_3_splitting(X, y)
-        engineer.step_4_training(X_train, X_test, y_train, y_test)
-        engineer.step_5_artifacts()
-        
+        engineer.execute_training(config)
         if entry:
             entry["status"] = "completed"
             entry["accuracy"] = f"{round(engineer.best_score * 100, 2)}%"
             entry["artifacts"] = engineer.artifacts
-            entry["target_col"] = engineer.target
-            # IMPORTANT: Save the extracted metadata so Frontend can build the form
             entry["feature_metadata"] = engineer.feature_metadata
-            
+            entry["target_col"] = engineer.target
     except Exception as e:
-        engineer.log(f"ERROR: {str(e)}")
+        engineer.log(f"Training Error: {e}")
         logger.error(traceback.format_exc())
-        if entry:
-            entry["status"] = "failed"
-            entry["error"] = str(e)
+        if entry: entry["status"] = "failed"
 
 # --- API ENDPOINTS ---
 
@@ -336,9 +347,10 @@ def get_logs(model_id: str):
     if not entry: raise HTTPException(404, "Model not found")
     return {
         "logs": entry["logs"], 
-        "status": entry["status"], 
+        "status": entry["status"],
+        "analysis_result": entry.get("analysis_result"), # NEW: Send suggestions
         "artifacts": entry.get("artifacts", {}),
-        "feature_metadata": entry.get("feature_metadata", []) # Send metadata to frontend
+        "feature_metadata": entry.get("feature_metadata", [])
     }
 
 @app.get("/download/{model_id}/{file_type}")
@@ -356,21 +368,18 @@ class PredictReq(BaseModel):
 def predict(model_id: str, req: PredictReq):
     path = os.path.join(ARTIFACTS_DIR, f"{model_id}_model.pkl")
     if not os.path.exists(path): raise HTTPException(404, "Model not ready")
-    
     try:
         artifact = joblib.load(path)
         model = artifact["pipeline"]
         le = artifact["le"]
-        
         df = pd.DataFrame([req.data])
         pred = model.predict(df)[0]
-        
         if le: pred = le.inverse_transform([int(pred)])[0]
-            
         return {"prediction": str(pred), "model_id": model_id}
     except Exception as e:
         raise HTTPException(500, str(e))
 
+# --- STEP 1: UPLOAD ---
 @app.post("/upload")
 async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fid = str(uuid.uuid4())
@@ -380,13 +389,27 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
         
     mid = str(uuid.uuid4())
     entry = {
-        "id": mid, "name": filename, "status": "training", "accuracy": None, 
-        "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
-        "artifacts": {}, "feature_metadata": []
+        "id": mid, "name": filename, "status": "analyzing", # Initial status
+        "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
+        "artifacts": {}, "file_path": path # Save path for later
     }
     projects_db.insert(0, entry)
-    bg_tasks.add_task(run_pipeline, mid, path)
+    bg_tasks.add_task(analyze_task, mid, path)
     return entry
+
+# --- STEP 2: START TRAINING ---
+class TrainConfig(BaseModel):
+    target: str
+    drop_columns: List[str]
+
+@app.post("/models/{model_id}/train")
+def start_training(model_id: str, config: TrainConfig, bg_tasks: BackgroundTasks):
+    entry = next((item for item in projects_db if item["id"] == model_id), None)
+    if not entry: raise HTTPException(404, "Model not found")
+    
+    entry["status"] = "training"
+    bg_tasks.add_task(training_task, model_id, entry["file_path"], config.dict())
+    return {"status": "started"}
 
 if __name__ == "__main__":
     import uvicorn
