@@ -1,9 +1,8 @@
 fastapi
 uvicorn
-pandas
-numpy
-scikit-learn
-joblib
+pydantic
 google-genai
+pandas
+scikit-learn
 python-multipart
-
+numpy
