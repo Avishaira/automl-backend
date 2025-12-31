@@ -4,5 +4,6 @@ pandas
 numpy
 scikit-learn
 joblib
-google-generativeai
+google-genai
 python-multipart
+
