@@ -56,7 +56,7 @@ def add_log(model_id: str, message: str):
         entry["logs"].append(log_entry)
         logger.info(f"Project {model_id}: {message}")
 
-# --- GEMINI BRAIN (With Robust Fallback) ---
+# --- GEMINI BRAIN (With Dynamic Model Discovery) ---
 class GeminiBrain:
     def __init__(self):
         # Checks for environment variable first, then falls back to hardcoded key
@@ -64,36 +64,90 @@ class GeminiBrain:
         self.api_key = env_key or "AIzaSyBgqQKWB_FKtTDhxlV36ZiWRwrAaPqZzZY"
         
         self.active = False
+        self.model_name = "gemini-1.5-flash" # Default fallback
         
         if self.api_key:
             # DEBUG LOG: Print first 5 chars to verify key is loaded
             masked_key = self.api_key[:5] + "..." if self.api_key else "None"
             logger.info(f"GeminiBrain initializing with Key: {masked_key}")
             
+            # 1. Configure Library (just in case)
             try:
                 genai.configure(api_key=self.api_key)
                 self.active = True
             except Exception as e:
                 logger.error(f"Failed to configure Gemini Lib: {e}")
+
+            # 2. Dynamic Model Discovery (The Fix for 404s)
+            discovered = self._discover_best_model()
+            if discovered:
+                self.model_name = discovered
+                logger.info(f"🌟 USING MODEL: {self.model_name}")
         else:
             logger.warning("Gemini API Key missing! Set GEMINI_API_KEY environment variable.")
 
-    def _generate_via_rest(self, prompt, model="gemini-1.5-flash"):
+    def _discover_best_model(self):
         """
-        Direct REST API fallback. Bypasses the python library entirely.
+        Asks Google API what models are actually available to this key
+        to avoid 404 'Model Not Found' errors.
         """
-        logger.info(f"Attempting Raw REST API Connection ({model})...")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                # Filter for models that support generating content
+                available_models = [
+                    m['name'].replace('models/', '') 
+                    for m in data.get('models', []) 
+                    if 'generateContent' in m.get('supportedGenerationMethods', [])
+                ]
+                
+                logger.info(f"Available Models: {available_models}")
+                
+                # Preferred order of selection
+                preferences = [
+                    'gemini-1.5-flash', 
+                    'gemini-1.5-flash-latest', 
+                    'gemini-1.5-flash-001',
+                    'gemini-1.5-flash-002',
+                    'gemini-1.5-pro',
+                    'gemini-1.5-pro-latest',
+                    'gemini-1.5-pro-001',
+                    'gemini-pro',
+                    'gemini-1.0-pro'
+                ]
+                
+                # Find the first preferred model that exists in the available list
+                for pref in preferences:
+                    if pref in available_models:
+                        return pref
+                
+                # If none of our favorites are there, take the first valid one
+                if available_models:
+                    return available_models[0]
+            else:
+                logger.warning(f"Model discovery failed ({response.status_code}). Using default.")
+        except Exception as e:
+            logger.warning(f"Model discovery error: {e}")
+        
+        return None
+
+    def _generate_via_rest(self, prompt):
+        """
+        Direct REST API fallback using the dynamically discovered model.
+        """
+        logger.info(f"Attempting Raw REST API Connection ({self.model_name})...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
         headers = {'Content-Type': 'application/json'}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
         }
         
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
             if response.status_code == 200:
                 data = response.json()
-                # Handle cases where response might be blocked/empty
                 if 'candidates' in data and data['candidates']:
                     return data['candidates'][0]['content']['parts'][0]['text']
                 else:
@@ -105,55 +159,28 @@ class GeminiBrain:
             raise Exception(f"REST Connection failed: {str(e)}")
 
     def test_connection(self):
-        """Robust connectivity test that tries multiple methods"""
+        """Robust connectivity test"""
         if not self.active: 
-            return False, "API Key not found in environment variables."
+            return False, "API Key not found."
         
-        # List of models to try in order of preference
-        candidates = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-        
-        # 1. Try Python Library
-        for model_name in candidates:
-            try:
-                model = genai.GenerativeModel(model_name)
-                model.generate_content("Ping")
-                return True, f"Connected via Library ({model_name})"
-            except Exception:
-                continue # Silently try next
-
-        # 2. Try REST API (if library fails completely)
+        # Try REST API with the discovered model
         try:
-            self._generate_via_rest("Ping", model="gemini-1.5-flash")
-            return True, "Connected via REST Fallback"
-        except Exception:
-            pass
-            
-        return False, "All connection attempts (Library & REST) failed."
+            self._generate_via_rest("Ping")
+            return True, f"Connected via REST ({self.model_name})"
+        except Exception as e:
+            logger.error(f"Test Connection Failed: {e}")
+            return False, f"Connection Failed: {str(e)}"
 
     def chat(self, message: str):
         if not self.active: return "AI is unavailable (API Key missing)."
         
-        # 1. Try Standard Library (Robust Loop)
-        candidates = [
-            'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro', 'gemini-1.0-pro'
-        ]
-        
-        for model_name in candidates:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(message)
-                return response.text
-            except Exception:
-                continue # Silently try next
-        
-        # 2. If all library attempts fail, Try REST API
+        # Always use REST fallback now as it's more reliable with the dynamic model name
         try:
             return self._generate_via_rest(message)
         except Exception as e:
-            return f"Error communicating with Gemini (Both Lib & REST failed). Details: {str(e)}"
+            return f"Error communicating with Gemini. Details: {str(e)}"
 
     def analyze(self, df_head_csv, columns_list):
-        # Simplified analyze that uses the chat function to leverage the same robust logic
         prompt = f"""
         Act as a Data Scientist. Analyze this dataset structure.
         Columns: {columns_list}
