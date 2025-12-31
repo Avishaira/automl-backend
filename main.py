@@ -10,6 +10,7 @@ import uuid
 import traceback
 import time
 import io
+import warnings
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -37,6 +38,9 @@ os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoML_Brain")
+
+# Suppress Deprecation Warnings from Google GenAI
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 
 app = FastAPI(title="Gemini Expert AutoML")
 
@@ -78,30 +82,6 @@ class GeminiBrain:
         else:
             logger.warning("Gemini API Key missing! AI features will be disabled.")
 
-    def _get_model(self):
-        """
-        Dynamically attempts to find a working model from a list of known aliases.
-        """
-        if not self.active:
-            raise Exception("AI is not active or configured.")
-
-        # If we already found a working model, use it
-        if self.working_model_name:
-            return genai.GenerativeModel(self.working_model_name)
-
-        # List of models to try in order of preference
-        candidates = [
-            'gemini-1.5-flash',
-            'gemini-1.5-pro',
-            'gemini-pro',
-            'gemini-1.0-pro',
-            'gemini-1.5-flash-latest'
-        ]
-
-        # Return the first one (we will catch errors during generation)
-        # We default to flash, but logic below handles the fallback
-        return genai.GenerativeModel(candidates[0])
-
     def _generate_content_robust(self, prompt):
         """
         Tries multiple model names if 404s occur.
@@ -118,13 +98,16 @@ class GeminiBrain:
                 logger.warning(f"Previously working model {self.working_model_name} failed: {e}")
                 self.working_model_name = None # Reset and try list
         
-        # Candidate list
+        # Extended Candidate list - trying specific versions often helps with 404s
         candidates = [
             'gemini-1.5-flash',
+            'gemini-1.5-flash-latest',
+            'gemini-1.5-flash-001',
             'gemini-1.5-pro',
+            'gemini-1.5-pro-latest',
+            'gemini-1.5-pro-001',
             'gemini-pro',
-            'gemini-1.0-pro',
-            'gemini-1.5-flash-latest'
+            'gemini-1.0-pro'
         ]
 
         last_error = None
@@ -136,13 +119,13 @@ class GeminiBrain:
                 
                 # If we get here, it worked
                 self.working_model_name = model_name
-                logger.info(f"Successfully connected to: {model_name}")
+                logger.info(f"SUCCESS: Connected to model: {model_name}")
                 return response
             except Exception as e:
                 error_str = str(e).lower()
                 # Only continue if it's a "Not Found" or "404" error
                 if "404" in error_str or "not found" in error_str:
-                    logger.warning(f"Model {model_name} not found (404). Trying next...")
+                    logger.warning(f"Model {model_name} failed (404). Trying next...")
                     last_error = e
                     continue
                 else:
