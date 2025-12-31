@@ -59,11 +59,17 @@ def add_log(model_id: str, message: str):
 # --- GEMINI BRAIN (With Robust Fallback) ---
 class GeminiBrain:
     def __init__(self):
-        # Checks for standard environment variable names
-        self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        # Checks for environment variable first, then falls back to hardcoded key
+        env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        self.api_key = env_key or "AIzaSyBgqQKWB_FKtTDhxlV36ZiWRwrAaPqZzZY"
+        
         self.active = False
         
         if self.api_key:
+            # DEBUG LOG: Print first 5 chars to verify key is loaded
+            masked_key = self.api_key[:5] + "..." if self.api_key else "None"
+            logger.info(f"GeminiBrain initializing with Key: {masked_key}")
+            
             try:
                 genai.configure(api_key=self.api_key)
                 self.active = True
