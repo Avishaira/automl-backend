@@ -1,18 +1,19 @@
 import os
 import logging
 import io
-import traceback
+import json
 import uvicorn
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
 from google import genai
 from google.genai import types
 
-# ML Imports for the "Sandbox"
-from sklearn.model_selection import train_test_split, cross_val_score
+# ML Imports
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor
@@ -26,14 +27,23 @@ logger = logging.getLogger("AutoML_Brain")
 
 app = FastAPI()
 
-# --- Global In-Memory State (For Demo Purposes) ---
-# In a real production app, use a database (Firestore/SQL) and Object Storage (S3).
+# --- CRITICAL: CORS MIDDLEWARE ---
+# This allows your frontend to talk to this backend without security blocks.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Global State ---
 class SessionState:
     def __init__(self):
         self.df: Optional[pd.DataFrame] = None
         self.target_col: Optional[str] = None
         self.feature_cols: List[str] = []
-        self.task_type: str = "unknown" # 'classification' or 'regression'
+        self.task_type: str = "unknown"
         self.best_model: Any = None
         self.best_model_code: str = ""
         self.best_score: float = -float("inf")
@@ -43,6 +53,9 @@ class SessionState:
 session = SessionState()
 
 # --- Pydantic Models ---
+class ChatRequest(BaseModel):
+    message: str
+
 class ConfigResponse(BaseModel):
     suggested_target: str
     suggested_features: List[str]
@@ -61,10 +74,8 @@ class TrainResponse(BaseModel):
     iterations_run: int
     best_score: float
     best_algorithm_code: str
-    message: str
 
 # --- Helper Functions ---
-
 def get_gemini_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -72,35 +83,34 @@ def get_gemini_client():
     return genai.Client(api_key=api_key)
 
 def clean_data(df, target, features):
-    """Prepares data for ML: Handles missing values and encoding."""
+    # Select columns
     X = df[features].copy()
     y = df[target].copy()
 
-    # 1. Handle Missing Values
-    # Simple strategy: Fill numeric with mean, categorical with mode
-    # For this demo, we drop rows with missing target
+    # Drop missing target
     y = y.dropna()
     X = X.loc[y.index]
 
-    # Impute X
+    # Initialize Preprocessors
+    session.encoders = {}
+    session.imputer = SimpleImputer(strategy='mean')
+
+    # Identify types
     num_cols = X.select_dtypes(include=[np.number]).columns
     cat_cols = X.select_dtypes(exclude=[np.number]).columns
-    
-    # Store encoders for prediction later
-    session.encoders = {}
-    
+
+    # 1. Impute Numerics
+    if len(num_cols) > 0:
+        X[num_cols] = session.imputer.fit_transform(X[num_cols])
+
+    # 2. Encode Categoricals
     if len(cat_cols) > 0:
         for col in cat_cols:
             le = LabelEncoder()
+            # Convert to string to handle mixed types safely
             X[col] = X[col].astype(str)
             X[col] = le.fit_transform(X[col])
             session.encoders[col] = le
-    
-    # Simple Mean Imputation for numbers
-    if len(num_cols) > 0:
-        imp = SimpleImputer(strategy='mean')
-        X[num_cols] = imp.fit_transform(X[num_cols])
-        session.imputer = imp
 
     return X, y
 
@@ -108,15 +118,39 @@ def clean_data(df, target, features):
 
 @app.get("/")
 async def root():
+    """Health check endpoint."""
     return {
-        "status": "ready", 
+        "status": "alive", 
         "data_loaded": session.df is not None,
-        "best_score": session.best_score
+        "best_score": session.best_score if session.best_score > -float('inf') else None
     }
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    """Chat with data context."""
+    try:
+        client = get_gemini_client()
+        
+        system_context = "You are an expert Data Science Assistant."
+        if session.df is not None:
+            system_context += f"\n\nDATA CONTEXT:\n- Columns: {list(session.df.columns)}\n- Rows: {len(session.df)}\n"
+            if session.task_type:
+                system_context += f"- Task: {session.task_type}\n- Target: {session.target_col}\n"
+            if session.best_model:
+                system_context += f"- Current Best Model Score: {session.best_score:.4f}\n"
+
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=f"{system_context}\n\nUser: {request.message}",
+            config=types.GenerateContentConfig(temperature=0.7)
+        )
+        return {"response": response.text or "No response."}
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        return {"response": f"I encountered an error: {str(e)}"}
 
 @app.post("/upload")
 async def upload_dataset(file: UploadFile = File(...)):
-    """Step 1: Upload and read the CSV."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files allowed.")
     
@@ -124,12 +158,15 @@ async def upload_dataset(file: UploadFile = File(...)):
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
         session.df = df
-        session.best_model = None # Reset previous model
+        
+        # Reset State
+        session.best_model = None
         session.best_score = -float("inf")
+        session.target_col = None
         
         return {
-            "message": "Dataset uploaded successfully",
-            "rows": df.shape[0],
+            "message": "Upload successful",
+            "rows": len(df),
             "columns": list(df.columns),
             "preview": df.head(3).to_dict()
         }
@@ -139,35 +176,31 @@ async def upload_dataset(file: UploadFile = File(...)):
 
 @app.post("/analyze", response_model=ConfigResponse)
 async def analyze_data():
-    """Step 2: AI analyzes data and suggests Target/Features."""
     if session.df is None:
         raise HTTPException(status_code=400, detail="No dataset uploaded.")
 
     client = get_gemini_client()
     
-    # Prepare metadata for Gemini
     buffer = io.StringIO()
     session.df.info(buf=buffer)
     info_str = buffer.getvalue()
     head_str = session.df.head(5).to_markdown()
     
     prompt = f"""
-    Analyze this dataset structure and sample:
-    
+    Analyze this dataset:
     {info_str}
     
-    Sample Data:
+    Sample:
     {head_str}
     
-    1. Identify the most likely Dependent Variable (Target) column.
-    2. Identify relevant Independent Variables (Features).
-    3. Determine if this is a 'classification' or 'regression' task.
+    Task: Identify the most likely target variable and feature variables.
+    Determine if this is classification or regression.
     
-    Respond in strict JSON format:
+    Return JSON:
     {{
       "suggested_target": "column_name",
-      "suggested_features": ["col1", "col2", ...],
-      "task_type": "classification" or "regression"
+      "suggested_features": ["col1", "col2"],
+      "task_type": "classification"
     }}
     """
     
@@ -175,98 +208,76 @@ async def analyze_data():
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.2
-            )
+            config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        import json
-        result = json.loads(response.text)
-        return ConfigResponse(**result)
+        return ConfigResponse(**json.loads(response.text))
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"AI Analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI Analysis failed: {e}")
 
 @app.post("/set-config")
 async def set_config(config: UserConfig):
-    """Step 3 & 4: User Validates and Confirms variables."""
     if session.df is None:
         raise HTTPException(status_code=400, detail="No dataset.")
     
-    # Validate columns exist
-    missing = [c for c in config.features + [config.target] if c not in session.df.columns]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Columns not found: {missing}")
-
     session.target_col = config.target
     session.feature_cols = config.features
     session.task_type = config.task_type
     
-    return {"message": "Configuration saved. Ready to train."}
+    return {"message": "Config saved."}
 
 @app.post("/train", response_model=TrainResponse)
 async def train_loop(iterations: int = 3):
-    """Step 5: The Loop. AI proposes code, System runs it, Score improves."""
     if not session.target_col or not session.feature_cols:
-        raise HTTPException(status_code=400, detail="Configuration not set.")
+        raise HTTPException(status_code=400, detail="Config missing. Run analysis first.")
 
-    # Prepare Data
     try:
         X, y = clean_data(session.df, session.target_col, session.feature_cols)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
     except Exception as e:
-         raise HTTPException(status_code=500, detail=f"Data prep failed: {e}")
+         raise HTTPException(status_code=500, detail=f"Data Prep Error: {e}")
 
     client = get_gemini_client()
-    history = [] # Keep track of what we tried
+    history = []
     
     for i in range(iterations):
-        logger.info(f"--- AutoML Loop Iteration {i+1} ---")
-        
-        # 1. Ask Gemini for Model Code
         prompt = f"""
-        Task: Write Python code to instantiate a scikit-learn model for {session.task_type}.
-        Data Info: {X.shape[1]} features, {X.shape[0]} rows.
+        Write Python code to instantiate a scikit-learn model for {session.task_type}.
+        Data Shape: {X.shape}
         Goal: Maximize {'Accuracy' if session.task_type == 'classification' else 'R2 Score'}.
         
         Previous attempts: {history}
         Current Best Score: {session.best_score}
         
-        Return ONLY the python code to instantiate the model object named 'model'.
-        Do not include imports. Use standard sklearn params.
-        Example: model = RandomForestClassifier(n_estimators=100, max_depth=5)
+        Return ONLY code to instantiate 'model'. No imports.
+        Example: model = RandomForestClassifier(n_estimators=100)
         """
         
-        resp = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.7)
-        )
-        
-        code_snippet = resp.text.strip().replace("```python", "").replace("```", "").strip()
-        
-        # 2. "Sandbox" Execution (Restricted Environment)
-        local_scope = {
-            "RandomForestClassifier": RandomForestClassifier,
-            "RandomForestRegressor": RandomForestRegressor,
-            "GradientBoostingClassifier": GradientBoostingClassifier,
-            "GradientBoostingRegressor": GradientBoostingRegressor,
-            "LinearRegression": LinearRegression,
-            "LogisticRegression": LogisticRegression,
-            "SVC": SVC,
-            "SVR": SVR
-        }
-        
         try:
-            # DANGEROUS IN PROD: We use exec() here to simulate the agent writing code.
-            # In a real app, strict sandboxing is required.
-            exec(code_snippet, {}, local_scope)
-            model = local_scope.get("model")
+            resp = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.7)
+            )
             
-            if not model:
-                raise ValueError("AI code did not define 'model'")
-                
-            # 3. Train & Evaluate
+            code = resp.text.strip().replace("```python", "").replace("```", "").strip()
+            
+            # Sandbox Scope
+            scope = {
+                "RandomForestClassifier": RandomForestClassifier,
+                "RandomForestRegressor": RandomForestRegressor,
+                "GradientBoostingClassifier": GradientBoostingClassifier,
+                "GradientBoostingRegressor": GradientBoostingRegressor,
+                "LinearRegression": LinearRegression,
+                "LogisticRegression": LogisticRegression,
+                "SVC": SVC, "SVR": SVR
+            }
+            
+            exec(code, {}, scope)
+            model = scope.get("model")
+            
+            if not model: raise ValueError("Model not defined in code")
+            
             model.fit(X_train, y_train)
             preds = model.predict(X_test)
             
@@ -274,56 +285,54 @@ async def train_loop(iterations: int = 3):
                 score = accuracy_score(y_test, preds)
             else:
                 score = r2_score(y_test, preds)
+                
+            history.append({"code": code, "score": score})
             
-            history.append({"code": code_snippet, "score": score})
-            
-            # 4. Update Best
             if score > session.best_score:
                 session.best_score = score
                 session.best_model = model
-                session.best_model_code = code_snippet
-                logger.info(f"New Record! Score: {score} | Code: {code_snippet}")
+                session.best_model_code = code
                 
         except Exception as e:
-            logger.error(f"Attempt failed: {e}")
-            history.append({"code": code_snippet, "error": str(e)})
-            
+            logger.error(f"Loop {i} failed: {e}")
+            history.append({"error": str(e)})
+
     return TrainResponse(
         status="success",
         iterations_run=iterations,
         best_score=session.best_score,
-        best_algorithm_code=session.best_model_code,
-        message=f"AutoML Complete. Best model achieved score: {session.best_score:.4f}"
+        best_algorithm_code=session.best_model_code
     )
 
 @app.post("/predict")
 async def make_prediction(request: PredictionRequest):
-    """Step 6: Make predictions using the winning model."""
     if not session.best_model:
-        raise HTTPException(status_code=400, detail="No model trained yet.")
-        
+        raise HTTPException(status_code=400, detail="No model trained.")
+    
     try:
-        # Convert input dict to DataFrame
         input_df = pd.DataFrame([request.input_data])
         
-        # Apply same encoding/imputation
-        if session.imputer:
-            num_cols = input_df.select_dtypes(include=[np.number]).columns
-            if len(num_cols) > 0:
-                input_df[num_cols] = session.imputer.transform(input_df[num_cols])
-                
+        # Apply strict preprocessing alignment
+        num_cols = input_df.select_dtypes(include=[np.number]).columns
+        if len(num_cols) > 0 and session.imputer:
+            input_df[num_cols] = session.imputer.transform(input_df[num_cols])
+            
         for col, le in session.encoders.items():
             if col in input_df.columns:
-                # Handle unknown categories safely
-                input_df[col] = input_df[col].astype(str).map(lambda s: le.transform([s])[0] if s in le.classes_ else -1)
+                # Handle unseen labels by assigning -1 or a safe default
+                input_df[col] = input_df[col].astype(str).map(
+                    lambda s: le.transform([s])[0] if s in le.classes_ else 0
+                )
 
-        prediction = session.best_model.predict(input_df[session.feature_cols])
-        return {"prediction": float(prediction[0]), "model_used": session.best_model_code}
+        # Reorder columns to match training
+        input_df = input_df[session.feature_cols]
+        
+        pred = session.best_model.predict(input_df)
+        return {"prediction": float(pred[0]), "model_used": session.best_model_code}
         
     except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        # Return helpful error if features match failed
-        raise HTTPException(status_code=500, detail=f"Prediction failed. Ensure inputs match features: {session.feature_cols}. Error: {e}")
+        logger.error(f"Prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
