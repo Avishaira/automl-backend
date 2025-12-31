@@ -62,23 +62,53 @@ def add_log(model_id: str, message: str):
         entry["logs"].append(log_entry)
         logger.info(f"Project {model_id}: {message}")
 
-# --- GEMINI BRAIN ---
+# --- GEMINI BRAIN (Robust Version) ---
 class GeminiBrain:
     def __init__(self):
         # Support both naming conventions
         self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        self.active = False
+        self.model_name = 'gemini-1.5-flash' # Default preference
+        self.model = None
+
         if self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
-            self.active = True
+            try:
+                genai.configure(api_key=self.api_key)
+                self.model = genai.GenerativeModel(self.model_name)
+                self.active = True
+            except Exception as e:
+                logger.error(f"Failed to configure Gemini: {e}")
         else:
-            self.active = False
             logger.warning("Gemini API Key missing! AI features will be disabled.")
+
+    def _generate_content_robust(self, prompt):
+        """
+        Tries the preferred model, falls back to 'gemini-pro' if 404/Not Found occurs.
+        """
+        if not self.active or not self.model:
+            raise Exception("AI is not active or configured.")
+
+        try:
+            return self.model.generate_content(prompt)
+        except Exception as e:
+            error_str = str(e).lower()
+            # If the specific model is not found (404), try fallback
+            if "404" in error_str or "not found" in error_str:
+                logger.warning(f"Model {self.model_name} failed (404). Attempting fallback to 'gemini-pro'.")
+                try:
+                    self.model_name = 'gemini-pro'
+                    self.model = genai.GenerativeModel('gemini-pro')
+                    return self.model.generate_content(prompt)
+                except Exception as fallback_e:
+                    logger.error(f"Fallback model also failed: {fallback_e}")
+                    raise fallback_e
+            else:
+                raise e
 
     def chat(self, message: str):
         if not self.active: return "AI is unavailable (API Key missing)."
         try:
-            response = self.model.generate_content(message)
+            response = self._generate_content_robust(message)
             return response.text
         except Exception as e:
             return f"Error communicating with Gemini: {str(e)}"
@@ -106,7 +136,7 @@ class GeminiBrain:
         }}
         """
         try:
-            res = self.model.generate_content(prompt)
+            res = self._generate_content_robust(prompt)
             clean_text = res.text.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_text)
         except Exception as e:
@@ -159,7 +189,7 @@ class MLEngineer:
             suggestion["type"] = ai_advice.get("type", "regression").lower()
             suggestion["reasoning"] = ai_advice.get("reasoning", "")
         else:
-            self.log("AI unavailable. Waiting for user input.")
+            self.log("AI unavailable or failed. Waiting for user input.")
             
         entry = next((item for item in projects_db if item["id"] == self.model_id), None)
         if entry:
