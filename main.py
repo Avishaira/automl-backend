@@ -56,7 +56,7 @@ def add_log(model_id: str, message: str):
         entry["logs"].append(log_entry)
         logger.info(f"Project {model_id}: {message}")
 
-# --- GEMINI BRAIN (With REST Fallback) ---
+# --- GEMINI BRAIN (With Robust Fallback) ---
 class GeminiBrain:
     def __init__(self):
         # Checks for standard environment variable names
@@ -72,24 +72,12 @@ class GeminiBrain:
         else:
             logger.warning("Gemini API Key missing! Set GEMINI_API_KEY environment variable.")
 
-    def test_connection(self):
-        """Simple connectivity test for startup/health checks"""
-        if not self.active: 
-            return False, "API Key not found in environment variables."
-        try:
-            # Try a lightweight call to verify auth
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content("Ping")
-            return True, "Connection Successful"
-        except Exception as e:
-            return False, f"API Error: {str(e)}"
-
-    def _generate_via_rest(self, prompt):
+    def _generate_via_rest(self, prompt, model="gemini-1.5-flash"):
         """
         Direct REST API fallback. Bypasses the python library entirely.
         """
-        logger.info("Attempting Raw REST API Connection...")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
+        logger.info(f"Attempting Raw REST API Connection ({model})...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
         headers = {'Content-Type': 'application/json'}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
@@ -106,9 +94,35 @@ class GeminiBrain:
                     return "No content returned (Safety filter or empty response)."
             else:
                 logger.error(f"REST API Failed: {response.status_code} - {response.text}")
-                raise Exception(f"REST API Error {response.status_code}: {response.text}")
+                raise Exception(f"REST API Error {response.status_code}")
         except Exception as e:
             raise Exception(f"REST Connection failed: {str(e)}")
+
+    def test_connection(self):
+        """Robust connectivity test that tries multiple methods"""
+        if not self.active: 
+            return False, "API Key not found in environment variables."
+        
+        # List of models to try in order of preference
+        candidates = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+        
+        # 1. Try Python Library
+        for model_name in candidates:
+            try:
+                model = genai.GenerativeModel(model_name)
+                model.generate_content("Ping")
+                return True, f"Connected via Library ({model_name})"
+            except Exception:
+                continue # Silently try next
+
+        # 2. Try REST API (if library fails completely)
+        try:
+            self._generate_via_rest("Ping", model="gemini-1.5-flash")
+            return True, "Connected via REST Fallback"
+        except Exception:
+            pass
+            
+        return False, "All connection attempts (Library & REST) failed."
 
     def chat(self, message: str):
         if not self.active: return "AI is unavailable (API Key missing)."
@@ -130,7 +144,6 @@ class GeminiBrain:
         try:
             return self._generate_via_rest(message)
         except Exception as e:
-            # If REST also fails, return the detailed error
             return f"Error communicating with Gemini (Both Lib & REST failed). Details: {str(e)}"
 
     def analyze(self, df_head_csv, columns_list):
