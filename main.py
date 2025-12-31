@@ -62,48 +62,95 @@ def add_log(model_id: str, message: str):
         entry["logs"].append(log_entry)
         logger.info(f"Project {model_id}: {message}")
 
-# --- GEMINI BRAIN (Robust Version) ---
+# --- GEMINI BRAIN (Ultra-Robust Version) ---
 class GeminiBrain:
     def __init__(self):
-        # Support both naming conventions
         self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.active = False
-        self.model_name = 'gemini-1.5-flash' # Default preference
-        self.model = None
+        self.working_model_name = None
 
         if self.api_key:
             try:
                 genai.configure(api_key=self.api_key)
-                self.model = genai.GenerativeModel(self.model_name)
                 self.active = True
             except Exception as e:
                 logger.error(f"Failed to configure Gemini: {e}")
         else:
             logger.warning("Gemini API Key missing! AI features will be disabled.")
 
-    def _generate_content_robust(self, prompt):
+    def _get_model(self):
         """
-        Tries the preferred model, falls back to 'gemini-pro' if 404/Not Found occurs.
+        Dynamically attempts to find a working model from a list of known aliases.
         """
-        if not self.active or not self.model:
+        if not self.active:
             raise Exception("AI is not active or configured.")
 
-        try:
-            return self.model.generate_content(prompt)
-        except Exception as e:
-            error_str = str(e).lower()
-            # If the specific model is not found (404), try fallback
-            if "404" in error_str or "not found" in error_str:
-                logger.warning(f"Model {self.model_name} failed (404). Attempting fallback to 'gemini-pro'.")
-                try:
-                    self.model_name = 'gemini-pro'
-                    self.model = genai.GenerativeModel('gemini-pro')
-                    return self.model.generate_content(prompt)
-                except Exception as fallback_e:
-                    logger.error(f"Fallback model also failed: {fallback_e}")
-                    raise fallback_e
-            else:
-                raise e
+        # If we already found a working model, use it
+        if self.working_model_name:
+            return genai.GenerativeModel(self.working_model_name)
+
+        # List of models to try in order of preference
+        candidates = [
+            'gemini-1.5-flash',
+            'gemini-1.5-pro',
+            'gemini-pro',
+            'gemini-1.0-pro',
+            'gemini-1.5-flash-latest'
+        ]
+
+        # Return the first one (we will catch errors during generation)
+        # We default to flash, but logic below handles the fallback
+        return genai.GenerativeModel(candidates[0])
+
+    def _generate_content_robust(self, prompt):
+        """
+        Tries multiple model names if 404s occur.
+        """
+        if not self.active:
+            raise Exception("AI is not active.")
+
+        # If we have a known working model, try only that first
+        if self.working_model_name:
+            try:
+                model = genai.GenerativeModel(self.working_model_name)
+                return model.generate_content(prompt)
+            except Exception as e:
+                logger.warning(f"Previously working model {self.working_model_name} failed: {e}")
+                self.working_model_name = None # Reset and try list
+        
+        # Candidate list
+        candidates = [
+            'gemini-1.5-flash',
+            'gemini-1.5-pro',
+            'gemini-pro',
+            'gemini-1.0-pro',
+            'gemini-1.5-flash-latest'
+        ]
+
+        last_error = None
+        for model_name in candidates:
+            try:
+                logger.info(f"Attempting to use model: {model_name}")
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                
+                # If we get here, it worked
+                self.working_model_name = model_name
+                logger.info(f"Successfully connected to: {model_name}")
+                return response
+            except Exception as e:
+                error_str = str(e).lower()
+                # Only continue if it's a "Not Found" or "404" error
+                if "404" in error_str or "not found" in error_str:
+                    logger.warning(f"Model {model_name} not found (404). Trying next...")
+                    last_error = e
+                    continue
+                else:
+                    # If it's another error (like auth or quota), raise immediately
+                    raise e
+        
+        # If we exhausted the list
+        raise Exception(f"All model candidates failed. Last error: {str(last_error)}")
 
     def chat(self, message: str):
         if not self.active: return "AI is unavailable (API Key missing)."
