@@ -13,6 +13,7 @@ import io
 import warnings
 import requests # Added for REST fallback
 from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,16 +44,6 @@ logger = logging.getLogger("AutoML_Brain")
 # Suppress Deprecation Warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 
-app = FastAPI(title="Gemini Expert AutoML")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # --- IN-MEMORY DATABASE ---
 projects_db = []
 latest_project_id = None
@@ -68,6 +59,7 @@ def add_log(model_id: str, message: str):
 # --- GEMINI BRAIN (With REST Fallback) ---
 class GeminiBrain:
     def __init__(self):
+        # Checks for standard environment variable names
         self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.active = False
         
@@ -78,7 +70,19 @@ class GeminiBrain:
             except Exception as e:
                 logger.error(f"Failed to configure Gemini Lib: {e}")
         else:
-            logger.warning("Gemini API Key missing!")
+            logger.warning("Gemini API Key missing! Set GEMINI_API_KEY environment variable.")
+
+    def test_connection(self):
+        """Simple connectivity test for startup/health checks"""
+        if not self.active: 
+            return False, "API Key not found in environment variables."
+        try:
+            # Try a lightweight call to verify auth
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            response = model.generate_content("Ping")
+            return True, "Connection Successful"
+        except Exception as e:
+            return False, f"API Error: {str(e)}"
 
     def _generate_via_rest(self, prompt):
         """
@@ -95,7 +99,11 @@ class GeminiBrain:
             response = requests.post(url, headers=headers, json=payload, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                return data['candidates'][0]['content']['parts'][0]['text']
+                # Handle cases where response might be blocked/empty
+                if 'candidates' in data and data['candidates']:
+                    return data['candidates'][0]['content']['parts'][0]['text']
+                else:
+                    return "No content returned (Safety filter or empty response)."
             else:
                 logger.error(f"REST API Failed: {response.status_code} - {response.text}")
                 raise Exception(f"REST API Error {response.status_code}: {response.text}")
@@ -148,6 +156,30 @@ class GeminiBrain:
             return json.loads(clean)
         except:
             return None
+
+# --- APP LIFESPAN & STARTUP ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup Logic
+    logger.info("🚀 Booting AutoML Brain...")
+    brain = GeminiBrain()
+    success, msg = brain.test_connection()
+    if success:
+        logger.info(f"✅ GEMINI AI: CONNECTED. ({msg})")
+    else:
+        logger.error(f"❌ GEMINI AI: FAILED. ({msg})")
+    yield
+    # Shutdown Logic (if any)
+
+app = FastAPI(title="Gemini Expert AutoML", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- ML ENGINEER ---
 class MLEngineer:
@@ -334,6 +366,12 @@ class MLEngineer:
 # --- API ENDPOINTS ---
 @app.get("/")
 def health(): return {"status": "online", "message": "Robust AutoML Backend Running"}
+
+@app.get("/test_ai")
+def test_ai_endpoint():
+    brain = GeminiBrain()
+    success, msg = brain.test_connection()
+    return {"status": "connected" if success else "error", "message": msg}
 
 class ChatRequest(BaseModel):
     message: str
