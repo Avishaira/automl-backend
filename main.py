@@ -9,6 +9,7 @@ import datetime
 import uuid
 import traceback
 import time
+import io
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -50,6 +51,9 @@ app.add_middleware(
 # --- IN-MEMORY DATABASE ---
 projects_db = []
 
+# Global reference for the "Demo" mode (compatibility with V2 Frontend)
+latest_project_id = None
+
 def add_log(model_id: str, message: str):
     entry = next((item for item in projects_db if item["id"] == model_id), None)
     if entry:
@@ -61,31 +65,43 @@ def add_log(model_id: str, message: str):
 # --- GEMINI BRAIN ---
 class GeminiBrain:
     def __init__(self):
-        self.api_key = os.environ.get("GOOGLE_API_KEY")
+        # Support both naming conventions
+        self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if self.api_key:
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel('gemini-1.5-flash')
             self.active = True
         else:
             self.active = False
+            logger.warning("Gemini API Key missing! AI features will be disabled.")
 
-    def analyze(self, df_head_csv):
+    def chat(self, message: str):
+        if not self.active: return "AI is unavailable (API Key missing)."
+        try:
+            response = self.model.generate_content(message)
+            return response.text
+        except Exception as e:
+            return f"Error communicating with Gemini: {str(e)}"
+
+    def analyze(self, df_head_csv, columns_list):
         if not self.active: return None
         
         prompt = f"""
-        Act as a Data Scientist. Analyze this CSV sample:
+        Act as a Data Scientist. Analyze this dataset structure.
+        Columns: {columns_list}
+        Sample Data:
         {df_head_csv}
         
         Recommend:
         1. Target Column (prediction label).
-        2. Columns to DROP (ID, Name, Date, Unstructured text).
+        2. Columns to DROP (ID, Name, Date, Unstructured text, Leakage).
         3. Problem Type (Classification/Regression).
         
         Return JSON ONLY:
         {{
-            "target": "col_name",
-            "drop_columns": ["col_1", "col_2"],
-            "type": "classification" or "regression",
+            "target_suggestion": "col_name",
+            "drop_suggestions": ["col_1", "col_2"],
+            "type": "classification",
             "reasoning": "explanation"
         }}
         """
@@ -93,7 +109,8 @@ class GeminiBrain:
             res = self.model.generate_content(prompt)
             clean_text = res.text.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_text)
-        except:
+        except Exception as e:
+            logger.error(f"Gemini Analysis Error: {e}")
             return None
 
 # --- ML ENGINEER ---
@@ -112,6 +129,7 @@ class MLEngineer:
         self.model_type = None
         self.le = None
         self.feature_metadata = [] 
+        self.tournament_results = {}
         
     def log(self, msg):
         add_log(self.model_id, msg)
@@ -124,7 +142,7 @@ class MLEngineer:
         head_csv = self.df.head(5).to_csv(index=False)
         
         self.log("Consulting Gemini AI for recommendations...")
-        ai_advice = self.brain.analyze(head_csv)
+        ai_advice = self.brain.analyze(head_csv, str(columns))
         
         suggestion = {
             "all_columns": columns,
@@ -136,8 +154,8 @@ class MLEngineer:
 
         if ai_advice:
             self.log("AI Recommendations Received.")
-            suggestion["target"] = ai_advice.get("target", columns[-1])
-            suggestion["drop_columns"] = ai_advice.get("drop_columns", [])
+            suggestion["target"] = ai_advice.get("target_suggestion", columns[-1])
+            suggestion["drop_columns"] = ai_advice.get("drop_suggestions", [])
             suggestion["type"] = ai_advice.get("type", "regression").lower()
             suggestion["reasoning"] = ai_advice.get("reasoning", "")
         else:
@@ -148,6 +166,8 @@ class MLEngineer:
             entry["analysis_result"] = suggestion
             entry["status"] = "pending_approval"
             self.log("Waiting for user approval on variables...")
+        
+        return suggestion
 
     # --- STEP 2: EXECUTION ---
     def execute_training(self, user_config):
@@ -171,6 +191,12 @@ class MLEngineer:
         X_train, X_test, y_train, y_test = self.step_3_splitting(X, y)
         self.step_4_training(X_train, X_test, y_train, y_test)
         self.step_5_artifacts()
+        
+        return {
+            "winner": self.best_algo_name,
+            "test_accuracy": self.best_score,
+            "tournament_results": self.tournament_results
+        }
 
     def step_2_cleaning(self):
         self.log("Step 2: Data Cleaning & Feature Engineering...")
@@ -294,6 +320,8 @@ class MLEngineer:
                     score = r2_score(y_test, pipeline.predict(X_test))
                 self.log(f"--> {name} Score: {round(score, 4)}")
             
+            self.tournament_results[name] = float(score)
+
             if score > self.best_score:
                 self.best_score = score
                 self.best_model = pipeline
@@ -357,8 +385,122 @@ def training_task(model_id: str, file_path: str, config: dict):
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def health(): return {"status": "online"}
+def health(): return {"status": "online", "message": "Robust AutoML Backend Running"}
 
+# NEW: Chat Endpoint
+class ChatRequest(BaseModel):
+    message: str
+
+@app.post("/chat")
+async def chat_with_gemini(request: ChatRequest):
+    brain = GeminiBrain()
+    response = brain.chat(request.message)
+    return {"response": response}
+
+# NEW: V2 Frontend Compatibility Layer (Wrappers)
+@app.post("/analyze_strategy")
+async def analyze_strategy_v2(file: UploadFile = File(...)):
+    """Wrapper to make V2 Frontend work with V1 Robust Backend"""
+    global latest_project_id
+    
+    # 1. Save file like V1 does
+    fid = str(uuid.uuid4())
+    filename = file.filename.replace(" ", "_")
+    path = os.path.join(UPLOAD_DIR, f"{fid}_{filename}")
+    with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
+    
+    # 2. Create Project Entry
+    mid = str(uuid.uuid4())
+    latest_project_id = mid # Save for subsequent calls
+    entry = {
+        "id": mid, "name": filename, "status": "analyzing",
+        "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
+        "artifacts": {}, "feature_metadata": [],
+        "file_path": path
+    }
+    projects_db.insert(0, entry)
+    
+    # 3. Run Analysis Synchronously for V2 Frontend
+    engineer = MLEngineer(mid, path)
+    suggestion = engineer.analyze_data_structure()
+    
+    # 4. Return V2 Format
+    df = pd.read_csv(path)
+    preview = df.head().to_dict()
+    
+    return {
+        "columns": suggestion["all_columns"],
+        "preview": preview,
+        "rows": len(df),
+        "ai_strategy": json.dumps({
+            "target_suggestion": suggestion["target"],
+            "drop_suggestions": suggestion["drop_columns"],
+            "reasoning": suggestion["reasoning"]
+        })
+    }
+
+class TrainRequestV2(BaseModel):
+    target: str
+    drop_columns: List[str]
+
+@app.post("/train")
+async def train_v2(request: TrainRequestV2):
+    """Wrapper for V2 Frontend Training"""
+    global latest_project_id
+    if not latest_project_id:
+        raise HTTPException(400, "No active session. Upload file first.")
+    
+    entry = next((item for item in projects_db if item["id"] == latest_project_id), None)
+    if not entry: raise HTTPException(404, "Session expired")
+    
+    engineer = MLEngineer(latest_project_id, entry["file_path"])
+    
+    # Run training synchronously for V2
+    results = engineer.execute_training(request.dict())
+    
+    return {
+        "status": "success",
+        "tournament_results": results["tournament_results"],
+        "winner": results["winner"],
+        "test_accuracy": results["test_accuracy"]
+    }
+
+class PredictionRequest(BaseModel):
+    features: dict
+
+@app.post("/predict")
+async def predict_v2(request: PredictionRequest):
+    """Wrapper for V2 Frontend Prediction"""
+    global latest_project_id
+    if not latest_project_id: raise HTTPException(400, "No active model.")
+    
+    path = os.path.join(ARTIFACTS_DIR, f"{latest_project_id}_model.pkl")
+    if not os.path.exists(path): raise HTTPException(404, "Model not ready")
+    
+    try:
+        artifact = joblib.load(path)
+        model = artifact["pipeline"]
+        le = artifact["le"]
+        
+        # Safe dataframe creation
+        safe_data = {k: (v if v != "" else np.nan) for k, v in request.features.items()}
+        df = pd.DataFrame([safe_data])
+        
+        # Fill missing cols with default to prevent crash
+        model_cols = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else df.columns
+        for col in model_cols:
+            if col not in df.columns:
+                df[col] = 0
+        
+        pred = model.predict(df)[0]
+        if le: 
+            pred = le.inverse_transform([int(pred)])[0]
+            
+        return {"prediction": str(pred)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# --- ORIGINAL V1 ENDPOINTS (For backward compatibility) ---
 @app.get("/models")
 def get_models(): return {"models": projects_db}
 
@@ -382,27 +524,6 @@ def download_file(model_id: str, file_type: str):
     if not path or not os.path.exists(path): raise HTTPException(404, "File not found")
     return FileResponse(path, filename=os.path.basename(path))
 
-class PredictReq(BaseModel):
-    data: Dict[str, Any]
-
-@app.post("/predict/{model_id}")
-def predict(model_id: str, req: PredictReq):
-    path = os.path.join(ARTIFACTS_DIR, f"{model_id}_model.pkl")
-    if not os.path.exists(path): raise HTTPException(404, "Model not ready")
-    try:
-        artifact = joblib.load(path)
-        model = artifact["pipeline"]
-        le = artifact["le"]
-        
-        safe_data = {k: (v if v != "" else np.nan) for k, v in req.data.items()}
-        df = pd.DataFrame([safe_data])
-        
-        pred = model.predict(df)[0]
-        if le: pred = le.inverse_transform([int(pred)])[0]
-        return {"prediction": str(pred), "model_id": model_id}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
 @app.post("/upload")
 async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fid = str(uuid.uuid4())
@@ -415,13 +536,12 @@ async def upload(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
         "id": mid, "name": filename, "status": "analyzing",
         "accuracy": None, "logs": [], "created_at": datetime.datetime.now().strftime("%H:%M"), 
         "artifacts": {}, "feature_metadata": [],
-        "file_path": path # <--- התיקון הקריטי כאן
+        "file_path": path
     }
     projects_db.insert(0, entry)
     bg_tasks.add_task(analyze_task, mid, path)
     return entry
 
-# --- START TRAINING ---
 class TrainConfig(BaseModel):
     target: str
     drop_columns: List[str]
