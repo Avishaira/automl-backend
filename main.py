@@ -2,9 +2,15 @@ import os
 import logging
 import io
 import json
+import uuid
+import shutil
+import glob
+import pickle
 import uvicorn
 import pandas as pd
 import numpy as np
+from pathlib import Path
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,30 +33,24 @@ logger = logging.getLogger("AutoML_Brain")
 
 app = FastAPI()
 
-# --- CRITICAL: CORS MIDDLEWARE ---
-# This allows your frontend to talk to this backend without security blocks.
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Global State ---
-class SessionState:
-    def __init__(self):
-        self.df: Optional[pd.DataFrame] = None
-        self.target_col: Optional[str] = None
-        self.feature_cols: List[str] = []
-        self.task_type: str = "unknown"
-        self.best_model: Any = None
-        self.best_model_code: str = ""
-        self.best_score: float = -float("inf")
-        self.encoders: Dict = {}
-        self.imputer: Any = None
-
-session = SessionState()
+# --- FILE SYSTEM STORAGE ---
+# Uses a local directory. Note: On Render free tier, this wipes on restart.
+# For persistence, you'd need a persistent disk or cloud storage (S3/GCS).
+BASE_DIR = Path("models_storage")
+try:
+    BASE_DIR.mkdir(exist_ok=True)
+    logger.info(f"Storage initialized at {BASE_DIR.absolute()}")
+except Exception as e:
+    logger.error(f"Failed to create storage dir: {e}")
 
 # --- Pydantic Models ---
 class ChatRequest(BaseModel):
@@ -82,126 +82,146 @@ def get_gemini_client():
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing.")
     return genai.Client(api_key=api_key)
 
+def load_model_context(model_id: str):
+    """Loads metadata and data for a specific model."""
+    model_dir = BASE_DIR / model_id
+    if not model_dir.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+    
+    context = {"id": model_id, "dir": model_dir}
+    
+    # Load Metadata
+    meta_path = model_dir / "metadata.json"
+    if meta_path.exists():
+        with open(meta_path, "r") as f:
+            context["meta"] = json.load(f)
+    else:
+        context["meta"] = {"created_at": str(datetime.now()), "status": "new"}
+
+    # Load DF if exists
+    csv_path = model_dir / "original.csv"
+    if csv_path.exists():
+        context["df"] = pd.read_csv(csv_path)
+    else:
+        context["df"] = None
+        
+    return context
+
+def save_metadata(model_id: str, meta: dict):
+    with open(BASE_DIR / model_id / "metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
 def clean_data(df, target, features):
-    # Select columns
     X = df[features].copy()
     y = df[target].copy()
-
-    # Drop missing target
     y = y.dropna()
     X = X.loc[y.index]
 
-    # Initialize Preprocessors
-    session.encoders = {}
-    session.imputer = SimpleImputer(strategy='mean')
+    imputer = SimpleImputer(strategy='mean')
+    encoders = {}
 
-    # Identify types
     num_cols = X.select_dtypes(include=[np.number]).columns
     cat_cols = X.select_dtypes(exclude=[np.number]).columns
 
-    # 1. Impute Numerics
     if len(num_cols) > 0:
-        X[num_cols] = session.imputer.fit_transform(X[num_cols])
+        X[num_cols] = imputer.fit_transform(X[num_cols])
 
-    # 2. Encode Categoricals
     if len(cat_cols) > 0:
         for col in cat_cols:
             le = LabelEncoder()
-            # Convert to string to handle mixed types safely
             X[col] = X[col].astype(str)
             X[col] = le.fit_transform(X[col])
-            session.encoders[col] = le
-
-    return X, y
+            encoders[col] = le
+            
+    return X, y, imputer, encoders
 
 # --- Endpoints ---
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
+    return {"status": "alive", "version": "2.0", "storage": str(BASE_DIR)}
+
+# 1. LIST MODELS
+@app.get("/models/list")
+async def list_models():
+    models = []
+    if not BASE_DIR.exists():
+        return []
+        
+    for path in BASE_DIR.iterdir():
+        if path.is_dir():
+            meta_path = path / "metadata.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path) as f:
+                        models.append(json.load(f))
+                except Exception as e:
+                    logger.error(f"Error reading meta for {path}: {e}")
+                    
+    # Sort by date descending
+    models.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    return models
+
+# 2. CREATE MODEL
+@app.post("/models/create")
+async def create_model():
+    model_id = str(uuid.uuid4())[:8]
+    model_dir = BASE_DIR / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    meta = {
+        "id": model_id,
+        "name": f"Model {model_id}",
+        "created_at": datetime.now().isoformat(),
+        "status": "waiting_for_data",
+        "best_score": None
+    }
+    save_metadata(model_id, meta)
+    return meta
+
+# 3. UPLOAD DATASET (Per Model)
+@app.post("/models/{model_id}/upload")
+async def upload_dataset(model_id: str, file: UploadFile = File(...)):
+    ctx = load_model_context(model_id)
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="CSV only")
+    
+    contents = await file.read()
+    df = pd.read_csv(io.BytesIO(contents))
+    
+    # Save Original
+    df.to_csv(ctx['dir'] / "original.csv", index=False)
+    
+    # Update Meta
+    ctx['meta']['status'] = "data_uploaded"
+    ctx['meta']['rows'] = len(df)
+    ctx['meta']['cols'] = list(df.columns)
+    save_metadata(model_id, ctx['meta'])
+    
     return {
-        "status": "alive", 
-        "data_loaded": session.df is not None,
-        "best_score": session.best_score if session.best_score > -float('inf') else None
+        "message": "Upload successful",
+        "rows": len(df),
+        "columns": list(df.columns),
+        "preview": df.head(3).to_dict()
     }
 
-@app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
-    """Chat with data context."""
-    try:
-        client = get_gemini_client()
-        
-        system_context = "You are an expert Data Science Assistant."
-        if session.df is not None:
-            system_context += f"\n\nDATA CONTEXT:\n- Columns: {list(session.df.columns)}\n- Rows: {len(session.df)}\n"
-            if session.task_type:
-                system_context += f"- Task: {session.task_type}\n- Target: {session.target_col}\n"
-            if session.best_model:
-                system_context += f"- Current Best Model Score: {session.best_score:.4f}\n"
-
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"{system_context}\n\nUser: {request.message}",
-            config=types.GenerateContentConfig(temperature=0.7)
-        )
-        return {"response": response.text or "No response."}
-    except Exception as e:
-        logger.error(f"Chat error: {e}")
-        return {"response": f"I encountered an error: {str(e)}"}
-
-@app.post("/upload")
-async def upload_dataset(file: UploadFile = File(...)):
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files allowed.")
-    
-    try:
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        session.df = df
-        
-        # Reset State
-        session.best_model = None
-        session.best_score = -float("inf")
-        session.target_col = None
-        
-        return {
-            "message": "Upload successful",
-            "rows": len(df),
-            "columns": list(df.columns),
-            "preview": df.head(3).to_dict()
-        }
-    except Exception as e:
-        logger.error(f"Upload failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/analyze", response_model=ConfigResponse)
-async def analyze_data():
-    if session.df is None:
-        raise HTTPException(status_code=400, detail="No dataset uploaded.")
+# 4. ANALYZE (Per Model)
+@app.post("/models/{model_id}/analyze", response_model=ConfigResponse)
+async def analyze_data(model_id: str):
+    ctx = load_model_context(model_id)
+    if ctx['df'] is None:
+        raise HTTPException(status_code=400, detail="No data uploaded for this model")
 
     client = get_gemini_client()
-    
     buffer = io.StringIO()
-    session.df.info(buf=buffer)
-    info_str = buffer.getvalue()
-    head_str = session.df.head(5).to_markdown()
+    ctx['df'].info(buf=buffer)
     
     prompt = f"""
-    Analyze this dataset:
-    {info_str}
-    
+    Analyze dataset structure:
+    {buffer.getvalue()}
     Sample:
-    {head_str}
-    
-    Task: Identify the most likely target variable and feature variables.
-    Determine if this is classification or regression.
-    
-    Return JSON:
-    {{
-      "suggested_target": "column_name",
-      "suggested_features": ["col1", "col2"],
-      "task_type": "classification"
-    }}
+    {ctx['df'].head().to_markdown()}
+    Return JSON: {{ "suggested_target": "str", "suggested_features": ["str"], "task_type": "classification"|"regression" }}
     """
     
     try:
@@ -213,42 +233,54 @@ async def analyze_data():
         return ConfigResponse(**json.loads(response.text))
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"AI Analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/set-config")
-async def set_config(config: UserConfig):
-    if session.df is None:
-        raise HTTPException(status_code=400, detail="No dataset.")
-    
-    session.target_col = config.target
-    session.feature_cols = config.features
-    session.task_type = config.task_type
-    
-    return {"message": "Config saved."}
+# 5. SET CONFIG
+@app.post("/models/{model_id}/config")
+async def set_config(model_id: str, config: UserConfig):
+    ctx = load_model_context(model_id)
+    ctx['meta'].update({
+        "target": config.target,
+        "features": config.features,
+        "task_type": config.task_type,
+        "status": "configured"
+    })
+    save_metadata(model_id, ctx['meta'])
+    return {"message": "Config saved"}
 
-@app.post("/train", response_model=TrainResponse)
-async def train_loop(iterations: int = 3):
-    if not session.target_col or not session.feature_cols:
-        raise HTTPException(status_code=400, detail="Config missing. Run analysis first.")
+# 6. TRAIN (Per Model + Artifact Saving)
+@app.post("/models/{model_id}/train", response_model=TrainResponse)
+async def train_loop(model_id: str, iterations: int = 3):
+    ctx = load_model_context(model_id)
+    meta = ctx['meta']
+    
+    if "target" not in meta:
+        raise HTTPException(status_code=400, detail="Not configured")
 
     try:
-        X, y = clean_data(session.df, session.target_col, session.feature_cols)
+        X, y, imputer, encoders = clean_data(ctx['df'], meta['target'], meta['features'])
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+        
+        # Save Cleaning Artifacts
+        with open(ctx['dir'] / "clean_objects.pkl", "wb") as f:
+            pickle.dump({"imputer": imputer, "encoders": encoders}, f)
+            
     except Exception as e:
          raise HTTPException(status_code=500, detail=f"Data Prep Error: {e}")
 
     client = get_gemini_client()
+    best_score = -float("inf")
+    best_model = None
+    best_code = ""
     history = []
     
     for i in range(iterations):
         prompt = f"""
-        Write Python code to instantiate a scikit-learn model for {session.task_type}.
+        Write Python code to instantiate a scikit-learn model for {meta['task_type']}.
         Data Shape: {X.shape}
-        Goal: Maximize {'Accuracy' if session.task_type == 'classification' else 'R2 Score'}.
-        
+        Goal: Maximize {'Accuracy' if meta['task_type'] == 'classification' else 'R2 Score'}.
         Previous attempts: {history}
-        Current Best Score: {session.best_score}
-        
+        Current Best: {best_score}
         Return ONLY code to instantiate 'model'. No imports.
         Example: model = RandomForestClassifier(n_estimators=100)
         """
@@ -259,10 +291,8 @@ async def train_loop(iterations: int = 3):
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.7)
             )
-            
             code = resp.text.strip().replace("```python", "").replace("```", "").strip()
             
-            # Sandbox Scope
             scope = {
                 "RandomForestClassifier": RandomForestClassifier,
                 "RandomForestRegressor": RandomForestRegressor,
@@ -272,68 +302,103 @@ async def train_loop(iterations: int = 3):
                 "LogisticRegression": LogisticRegression,
                 "SVC": SVC, "SVR": SVR
             }
-            
             exec(code, {}, scope)
             model = scope.get("model")
             
-            if not model: raise ValueError("Model not defined in code")
-            
-            model.fit(X_train, y_train)
-            preds = model.predict(X_test)
-            
-            if session.task_type == 'classification':
-                score = accuracy_score(y_test, preds)
-            else:
-                score = r2_score(y_test, preds)
+            if model:
+                model.fit(X_train, y_train)
+                preds = model.predict(X_test)
+                score = accuracy_score(y_test, preds) if meta['task_type'] == 'classification' else r2_score(y_test, preds)
                 
-            history.append({"code": code, "score": score})
-            
-            if score > session.best_score:
-                session.best_score = score
-                session.best_model = model
-                session.best_model_code = code
+                history.append({"code": code, "score": score})
+                if score > best_score:
+                    best_score = score
+                    best_model = model
+                    best_code = code
                 
         except Exception as e:
             logger.error(f"Loop {i} failed: {e}")
-            history.append({"error": str(e)})
+
+    # Save Best Model Artifacts
+    if best_model:
+        with open(ctx['dir'] / "best_model.pkl", "wb") as f:
+            pickle.dump(best_model, f)
+        
+        with open(ctx['dir'] / "model_code.py", "w") as f:
+            f.write(best_code)
+            
+        ctx['meta']['best_score'] = best_score
+        ctx['meta']['status'] = "trained"
+        ctx['meta']['best_code'] = best_code
+        save_metadata(model_id, ctx['meta'])
 
     return TrainResponse(
-        status="success",
-        iterations_run=iterations,
-        best_score=session.best_score,
-        best_algorithm_code=session.best_model_code
+        status="success", iterations_run=iterations,
+        best_score=best_score, best_algorithm_code=best_code
     )
 
-@app.post("/predict")
-async def make_prediction(request: PredictionRequest):
-    if not session.best_model:
-        raise HTTPException(status_code=400, detail="No model trained.")
+# 7. PREDICT (Loads from Disk)
+@app.post("/models/{model_id}/predict")
+async def make_prediction(model_id: str, request: PredictionRequest):
+    ctx = load_model_context(model_id)
     
+    # Load Artifacts
+    try:
+        with open(ctx['dir'] / "best_model.pkl", "rb") as f:
+            model = pickle.load(f)
+        with open(ctx['dir'] / "clean_objects.pkl", "rb") as f:
+            clean_objs = pickle.load(f)
+            imputer = clean_objs['imputer']
+            encoders = clean_objs['encoders']
+    except FileNotFoundError:
+        raise HTTPException(status_code=400, detail="Model not trained yet")
+
     try:
         input_df = pd.DataFrame([request.input_data])
         
-        # Apply strict preprocessing alignment
+        # Apply Saved Cleaning Logic
         num_cols = input_df.select_dtypes(include=[np.number]).columns
-        if len(num_cols) > 0 and session.imputer:
-            input_df[num_cols] = session.imputer.transform(input_df[num_cols])
+        if len(num_cols) > 0:
+            input_df[num_cols] = imputer.transform(input_df[num_cols])
             
-        for col, le in session.encoders.items():
+        for col, le in encoders.items():
             if col in input_df.columns:
-                # Handle unseen labels by assigning -1 or a safe default
+                # Handle safe transform
                 input_df[col] = input_df[col].astype(str).map(
                     lambda s: le.transform([s])[0] if s in le.classes_ else 0
                 )
-
-        # Reorder columns to match training
-        input_df = input_df[session.feature_cols]
         
-        pred = session.best_model.predict(input_df)
-        return {"prediction": float(pred[0]), "model_used": session.best_model_code}
+        # Reorder
+        input_df = input_df[ctx['meta']['features']]
+        pred = model.predict(input_df)
+        return {"prediction": float(pred[0]), "model_used": ctx['meta'].get('best_code')}
         
     except Exception as e:
         logger.error(f"Prediction failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# 8. CHAT (Context Aware)
+@app.post("/models/{model_id}/chat")
+async def chat_endpoint(model_id: str, request: ChatRequest):
+    ctx = load_model_context(model_id)
+    client = get_gemini_client()
+    
+    meta = ctx['meta']
+    system_context = f"You are an expert Data Science Assistant analyzing Model ID: {model_id}."
+    
+    if meta.get('rows'):
+        system_context += f"\nData: {meta['rows']} rows, Columns: {meta.get('cols')}"
+    if meta.get('best_score'):
+        system_context += f"\nBest Score: {meta['best_score']:.4f}\nCode: {meta.get('best_code')}"
+        
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=f"{system_context}\n\nUser: {request.message}",
+        config=types.GenerateContentConfig(temperature=0.7)
+    )
+    return {"response": response.text}
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    logger.info("Starting Backend...")
     uvicorn.run(app, host="0.0.0.0", port=port)
